@@ -1,0 +1,10 @@
+{
+  "mount": "Mount",
+  "part": "Gear",
+  "origin": [0, 0, 0],
+  "direction": [0, -1, 0],
+  "pin_dia": 12,
+  "pin_length": 20,
+  "part_offset": 2,
+  "old_bore": {"dia": 18, "depth": 10}
+}

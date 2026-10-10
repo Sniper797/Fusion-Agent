@@ -1,0 +1,13 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "addin",
+    "id": "341074b2-511f-4b8c-9d1d-132077746e73",
+    "author": "Mohammed Ghassan",
+    "description": {
+        "": "Runs Python jobs dropped into a folder and writes the result back as JSON, so another program or an AI agent can drive Fusion."
+    },
+    "version": "1.0.0",
+    "runOnStartup": true,
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
