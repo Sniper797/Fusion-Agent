@@ -27,13 +27,15 @@ Arabic version: [README.md](README.md)
 | `run_job.py` | Sends a script to Fusion and waits for the result |
 | `install-windows.bat` | Copies the add-in into place on Windows |
 | `examples/` | Ready-made examples |
+| `tools/bench_mcp.py` | Measures both routes with the same code: this add-in, and Fusion's built-in MCP |
+| `tests/` | Tests that need no Fusion: `python -m unittest discover -s tests` |
 | `README.md` | This guide in Arabic |
 | `README.en.md` | This guide in English |
 | `CLAUDE.md` | Instructions for Claude Code, if you open it in this folder |
 
 ## Installation (once)
 
-You need Autodesk Fusion, and Python 3.7 or newer to run `run_job.py`. `run_job.py` needs no extra libraries.
+You need Autodesk Fusion, and Python 3.8 or newer to run `run_job.py`. `run_job.py` needs no extra libraries.
 
 **Get the package:** from GitHub, or from a zip someone sent you.
 
@@ -45,7 +47,7 @@ cd fusion-agent
 **On Windows:**
 1. Run `install-windows.bat`.
 2. In Fusion open **Utilities > Add-Ins** (or Shift+S), find **FusionAgent** in the list, and start it with its run button or the switch next to it. This window looks slightly different between Fusion versions. From then on it starts by itself every time Fusion starts.
-3. Check that it works: `python run_job.py ping` prints the name of the open document.
+3. Check that it works: `python run_job.py ping` prints every document Fusion has loaded, and which one is active. That includes documents Fusion loads for referenced parts of your assembly even though you never opened them: one assembly with referenced parts had six of them besides its open tab.
 
 > **`run_job.py` does not go into Fusion.** Don't add it to the Scripts and Add-Ins list; running it from there does nothing. It is the sender: it runs from a terminal (cmd, PowerShell or Terminal), or Claude Code runs it. The only thing that goes into Fusion is the `FusionAgent` add-in.
 
@@ -53,7 +55,7 @@ cd fusion-agent
 `~/Library/Application Support/Autodesk/Autodesk Fusion 360/API/AddIns/`
 then do steps 2 and 3.
 
-**Updating:** run `git pull`, run `install-windows.bat` again, then restart Fusion. The add-in is a copy inside Fusion's folder, so it does not update when the repository does.
+**Updating:** run `git pull`, run `install-windows.bat` again, then restart Fusion. The add-in is a copy inside Fusion's folder, so it does not update when the repository does. `run_job.py` tells you when the installed add-in is older than itself. To restart the add-in without closing Fusion: Shift+S, then stop FusionAgent and run it again.
 
 ## Usage
 
@@ -62,9 +64,15 @@ python run_job.py ping
 python run_job.py examples/inspect_design.py
 python run_job.py examples/check_clearance.py --args "{\"only\": [\"Gear\"]}"
 python run_job.py examples/export_stl.py --args-file my_args.json --save result.json
+python run_job.py examples/inspect_design.py --doc "Car"
+python run_job.py -c "print(design().rootComponent.name)"
+python run_job.py -e "design().timeline.count"
 ```
 
-**What it prints:** what the script printed, then `out`. If the script fails, it prints the full error.
+- `-c` sends code without a file, and `-e` sends one expression whose value comes back in `out["value"]`.
+- **What it prints:** what the script printed, then `out`.
+- **Long output** is cut at 8,000 characters (`--print-limit`), and the full result is saved to a file whose path is printed.
+- **If the script fails,** it prints the error with your script's own lines only, plus a hint when it matches a known trap.
 
 **Exit codes:**
 
@@ -72,9 +80,41 @@ python run_job.py examples/export_stl.py --args-file my_args.json --save result.
 |---|---|
 | 0 | Done |
 | 1 | The script raised an error |
-| 2 | The add-in is not running, or the input is wrong |
+| 2 | The add-in is not running, or the input is wrong, including a `--doc` name that matches no open document |
 | 3 | The add-in is busy with another job |
 | 4 | Timed out |
+| 5 | Refused by the pre-flight check, so it was not sent |
+
+## Choose the document: `--doc`
+
+By default a script works on the active document, the one in front of you. `--doc` pins it to an open document by name, even when that document is not the active one:
+
+```
+python run_job.py examples/inspect_design.py --doc "Car"
+```
+
+- **The name** is the tab name ("Car v12"), or the name without the version ("Car"), which keeps working after a save. Spaces and letter case don't matter.
+- **Where it looks:** only open documents, including the ones Fusion loads for referenced parts of an assembly. It never searches the cloud.
+- **What follows the pin:** `design()` and every helper, and `doc` in the script is that document.
+- **Pictures:** `save_viewport` refuses when the pinned document is not the active one, because it captures the visible window.
+- **What it prints:** `run_job.py` names the document the job ran on, and warns when the active document changed during the job.
+- **For a whole session:** put the name in the `FUSION_AGENT_DOC` environment variable.
+- It needs add-in 1.1.0 or newer.
+
+## Pre-flight check
+
+`run_job.py` reads the script before sending it, without contacting Fusion.
+
+**It refuses** (exit code 5) these, because each one has frozen Fusion or damaged a design before:
+- Walking cloud folders, `dataHubs`, `dataProjects`, `dataFolders` and `dataFiles`: in a loop, through an alias (`files = folder.dataFiles`), in a function called inside a loop or calling itself, or with `sorted`, `list` and the like. Going straight to a folder by name, one level at a time with `itemByName`, is allowed.
+- `computeAll()`.
+- Anything that waits for a click in Fusion: `messageBox`, `inputBox`, the file pickers, and `selectEntity`.
+
+**It only warns** about `allJoints`, `documents.open` without `False`, `save` and `saveAs`, `close(True)` and `close(False)`, and active-document names when you use `--doc`.
+
+- **To override:** `--allow modal-ui` (or the rule's name), or `--no-preflight`.
+- **Git Bash paths** such as `/c/Users/...` in `args` are rewritten to `C:/Users/...`, and it says so.
+- The check reads the code without running it, so it can miss things. It does not replace reading the script.
 
 ## Examples
 
@@ -88,7 +128,7 @@ python run_job.py examples/export_stl.py --args-file my_args.json --save result.
 | `demo_scene.py` | A **new** document with a mount, a pin and a gear to experiment on | Only creates a new document |
 | `snap_fit.py` | Turns the pin into a snap-fit, and opens a bore with a catch groove in the part | Yes, as one group at the end of the timeline |
 
-**Try the snap-fit without touching your own designs:**
+**Try the snap-fit without touching your own designs.** Run these steps without `--doc` and with `FUSION_AGENT_DOC` unset: `demo_scene.py` makes the new document the active one, and the steps after it work on the active document.
 
 ```
 python run_job.py examples/demo_scene.py
@@ -109,6 +149,7 @@ A script is an ordinary Python file that runs inside Fusion, with these names re
 |---|---|
 | `app`, `ui`, `adsk` | The Fusion application, its user interface, and the API library |
 | `args` | What you sent with `--args` or `--args-file` |
+| `doc` | The document the script works on: the one `--doc` pins, otherwise the active one |
 | `out` | A dictionary that comes back to you as the result |
 | `flush()` | Writes the result now. Call it after each step of a long job |
 | `agent_dir` | The add-in's folder, and the default place for output files |
@@ -126,7 +167,7 @@ A script is an ordinary Python file that runs inside Fusion, with these names re
 ```python
 # hello.py
 d = design()
-out["document"] = app.activeDocument.name
+out["document"] = doc.name
 out["occurrences"] = d.rootComponent.allOccurrences.count
 print("ok")
 ```
@@ -153,13 +194,28 @@ The add-in runs **any** Python file a job points to, with your account's rights 
 ## Known issues
 
 - **"FusionAgent is not running":** Fusion is closed, or the add-in is stopped. Start it from Shift+S.
-- **"busy":** another job is running right now, possibly from another session using the same add-in, since jobs run one at a time. If the wait drags on, a window open in Fusion, such as Scripts and Add-Ins, is usually holding the jobs until it is closed. If Fusion crashes during a job, the add-in cleans up after it the next time Fusion starts.
+- **"busy":** another job is running right now, possibly from another session using the same add-in, since jobs run one at a time. If a window open in Fusion, such as Scripts and Add-Ins, is holding the jobs, `run_job.py` names it after three seconds, and the job starts by itself once you close it. If Fusion crashes during a job, the add-in cleans up after it the next time Fusion starts.
 - **Timed out:** usually a dialog open in Fusion is blocking it, so close it. For long jobs use `--timeout 600`.
-- **Paths inside `args`:** write them as `C:/...`. A Git Bash path such as `/c/Users/...` fails silently.
+- **Paths inside `args`:** write them as `C:/...`. A Git Bash path such as `/c/Users/...` used to fail silently; `run_job.py` now rewrites it.
 - **Fusion's interface freezes:** the script runs on Fusion's main thread, so the interface stops until it finishes. Split long work into parts.
-- **Don't search cloud files inside a job.** A script that walked the `app.data` projects and folders froze Fusion ("Not Responding") twice, once for nine minutes and once for about forty, until it was restarted. If you need a file that is not open, open it yourself in Fusion first. If you know its path, go straight to it by name with `dataFolders.itemByName`, one level at a time.
-- **Scripts work on the active document.** `design()` and the editing helpers take whatever document is in front of you right now. Before any script that edits, run `ping` and check the document's name.
+- **Don't search cloud files inside a job.** A script that walked the `app.data` projects and folders froze Fusion ("Not Responding") twice, once for nine minutes and once for about forty, until it was restarted. The pre-flight check now refuses this. If you need a file that is not open, open it yourself in Fusion first. If you know its path, go straight to it by name with `dataFolders.itemByName`, one level at a time.
+- **Scripts work on the active document.** `design()` and the editing helpers take whatever document is in front of you right now. When the document matters, pin the job to it with `--doc`.
 - **A body whose volume can't be computed:** Fusion refuses to compute the volume of some bodies, or the distance to them, such as open surfaces and damaged geometry. The examples skip them and report them; use `try_value` in your own scripts.
+
+## Compared with Fusion's built-in MCP
+
+Fusion ships an official MCP server, switched on in Preferences > General > API. We measured both routes with the same code on a 633-body design, on 10 October 2026:
+
+| | FusionAgent | Built-in MCP |
+|---|---|---|
+| Round trip for a tiny job | 0.4 to 0.9 s, waiting on files | about 0.05 s |
+| Inspecting 633 bodies | Identical result body by body; the work inside Fusion takes the same time | |
+| Progress during a long job | Step by step through `flush()` | Nothing until the end |
+| Errors | Your script's lines and source, plus a structured error | Line numbers without source |
+| Scripts are files with `args` | Yes | No, code text sent every time |
+| Runs while a command such as Sketch is open | No | Yes, read-only |
+
+Re-measure on your machine: `python tools/bench_mcp.py`. It finds the MCP port by itself and only reads.
 
 ## With Claude Code
 

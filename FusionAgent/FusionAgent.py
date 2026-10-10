@@ -9,10 +9,12 @@ Folder (override with the FUSION_AGENT_DIR environment variable):
     macOS:   ~/Library/Application Support/FusionAgent
 
 Files in that folder:
-    job.json     queued job: {"id", "action": "exec_file" | "ping", "path", "args"}
+    job.json     queued job: {"id", "action": "exec_file" | "ping", "path", "args", "doc"}
+                 "doc" (optional, 1.1.0+) pins the job to the open document of that name
     job.running  the job being executed (claimed by renaming job.json)
     job.done     the last finished job
-    result.json  {"id", "status": "running" | "done" | "error", "out", "stdout", "traceback"}
+    result.json  {"id", "status": "running" | "done" | "error", "out", "stdout", "stderr",
+                  "traceback", "error", "ran_on", "active_before", "active_after"}
     alive.json   heartbeat, rewritten every half second while the add-in runs
 
 SECURITY: this add-in runs any Python file a job points to, with your user's
@@ -32,7 +34,7 @@ import threading
 import time
 import traceback
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 EVENT_ID = "FusionAgentJobEvent"
 POLL_SEC = 0.5
 
@@ -58,14 +60,33 @@ _event = None
 _handler = None
 _stop = None
 _thread = None
+_target = None          # the document a job is pinned to (job["doc"]); None means the active one
+STDOUT_KEEP = 20000     # characters of printed output kept in result.json
 
 
 # ----------------------------------------------------------------------- files
 
+def _jsonable(value):
+    """JSON keys must be strings: a script may well return {(a, b): gap}."""
+    if isinstance(value, dict):
+        return {k if isinstance(k, str) else str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def _dumps(data):
+    try:
+        return json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    except (TypeError, ValueError):
+        return json.dumps(_jsonable(data), ensure_ascii=False, indent=2,
+                          default=lambda v: try_value(lambda: str(v), "<unprintable %s>" % type(v).__name__))
+
+
 def _write_json(path, data):
     """Write atomically, so a reader never sees half a file. Windows refuses to
     replace a file another process has open, hence the short retry."""
-    text = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    text = _dumps(data)
     tmp = path + ".tmp"
     with io.open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
@@ -83,7 +104,13 @@ def _write_json(path, data):
 # Every function below is available by name inside a job script.
 
 def design():
-    """The active Fusion design, or a clear error when none is open."""
+    """The design of the document this job is pinned to (run_job.py --doc), else
+    the active design. Every helper below goes through here, so they follow the pin."""
+    if _target is not None:
+        d = adsk.fusion.Design.cast(_target.products.itemByProductType("DesignProductType"))
+        if d is None:
+            raise RuntimeError("Document %r has no Fusion design." % _target.name)
+        return d
     d = adsk.fusion.Design.cast(_app.activeProduct)
     if d is None:
         raise RuntimeError("No active Fusion design. Open a design first.")
@@ -204,6 +231,9 @@ def group_timeline(start_index, name):
 
 def save_viewport(path, width=1600, height=1000, fit=False):
     """Save the active viewport as an image. Returns True when the file exists."""
+    if _target is not None and not _target.isActive:
+        raise RuntimeError("save_viewport captures the active window, but this job is pinned to %r, "
+                           "which is not the active document. Make it active first." % _target.name)
     vp = _app.activeViewport
     if fit:
         cam = vp.camera
@@ -225,13 +255,70 @@ HELPERS = {f.__name__: f for f in (
 
 # ------------------------------------------------------------------------ jobs
 
+def _open_documents():
+    docs = _app.documents
+    return [docs.item(i) for i in range(docs.count)]
+
+
+def _doc_info(doc):
+    if doc is None:
+        return None
+    return {"name": doc.name, "isActive": try_value(lambda: doc.isActive),
+            "isVisible": try_value(lambda: doc.isVisible),       # True even for referenced parts, measured
+            "isModified": try_value(lambda: doc.isModified)}
+
+
+class JobInputError(LookupError):
+    """A job asked for something that is not there; reported without a traceback."""
+
+
+def _loose(text):
+    return " ".join((text or "").split()).casefold()
+
+
+def _resolve_doc(name):
+    """The one open document called `name`: its tab name ("Car v12"), or its name
+    without the version ("Car"), which survives saving. Spaces and case are loose:
+    Fusion's own tab names can carry a double space. Open documents only, including
+    the hidden ones Fusion loads for referenced parts; this never searches the cloud."""
+    want = _loose(name)
+    if not want:
+        raise JobInputError("--doc is empty. Give a document name, or leave --doc out.")
+    docs = _open_documents()
+
+    def file_name(d):
+        n = try_value(lambda: d.dataFile.name)           # None for a document never saved
+        return _loose(n) if n else None
+
+    tests = (lambda d: d.name == name,
+             lambda d: _loose(d.name) == want,
+             lambda d: _loose(re.sub(r"\s+v\d+$", "", d.name.strip())) == want,
+             lambda d: file_name(d) == want)
+    for test in tests:
+        hits = [d for d in docs if test(d)]
+        if len(hits) > 1:                                 # same name twice: the active, else the one with a tab
+            for prefer in (lambda d: try_value(lambda: d.isActive), lambda d: try_value(lambda: d.isVisible)):
+                preferred = [d for d in hits if prefer(d)]
+                if len(preferred) == 1:
+                    hits = preferred
+                    break
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            raise JobInputError("%d open documents match %r and none of them is the active or the only "
+                                "visible one: %s" % (len(hits), name, [_doc_info(d) for d in hits]))
+    raise JobInputError("No open document named %r. Open documents: %s" % (name, [d.name for d in docs]))
+
+
 def _ping():
     doc = _app.activeDocument
     return {"agent": VERSION, "fusion": _app.version, "python": sys.version.split()[0],
-            "agent_dir": AGENT_DIR, "document": doc.name if doc else None}
+            "agent_dir": AGENT_DIR, "document": doc.name if doc else None,
+            "documents": [_doc_info(d) for d in _open_documents()]}
 
 
 def _run_job(job, result):
+    global _target
     action = job.get("action", "exec_file")
     if action == "ping":
         result["out"] = _ping()
@@ -242,48 +329,126 @@ def _run_job(job, result):
     path = job["path"]
     with io.open(path, "r", encoding="utf-8-sig") as f:
         code = f.read()
+    if job.get("doc"):
+        _target = _resolve_doc(job["doc"])
     out = {}
-    buf = io.StringIO()
+    buf, err = io.StringIO(), io.StringIO()
     result["out"] = out
     result["script"] = path
+    result["ran_on"] = _doc_info(_target or _app.activeDocument)
 
     def flush():
         """Write the result so far, so a long or stuck job still shows progress."""
-        result["stdout"] = buf.getvalue()[-20000:]
+        text = buf.getvalue()
+        result["stdout"] = text[-STDOUT_KEEP:]
+        result["stdout_truncated"] = len(text) > STDOUT_KEEP
+        result["stderr"] = err.getvalue()[-STDOUT_KEEP:]
         _write_json(RESULT, result)
 
     scope = dict(HELPERS)
     scope.update({"__name__": "__fusion_agent_job__", "__file__": path,
                   "adsk": adsk, "app": _app, "ui": _ui,
+                  "doc": _target or _app.activeDocument,
                   "args": job.get("args") or {}, "out": out, "flush": flush,
                   "agent_dir": AGENT_DIR})
     flush()
     try:
-        with contextlib.redirect_stdout(buf):
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
             exec(compile(code, path, "exec"), scope)
     finally:
-        result["stdout"] = buf.getvalue()[-20000:]
+        _release_log_handlers((buf, err))
+        text = buf.getvalue()
+        result["stdout"] = text[-STDOUT_KEEP:]
+        result["stdout_truncated"] = len(text) > STDOUT_KEEP
+        result["stderr"] = err.getvalue()[-STDOUT_KEEP:]
+
+
+def _release_log_handlers(buffers):
+    """logging.basicConfig() inside a job binds a handler to the job's own buffer; point it
+    back at the real stderr, or every later log line in this Fusion session is lost."""
+    logging = sys.modules.get("logging")
+    if logging is None:
+        return
+    loggers = [logging.getLogger()] + [l for l in logging.Logger.manager.loggerDict.values()
+                                       if isinstance(l, logging.Logger)]
+    for lg in loggers:
+        for h in list(lg.handlers):
+            if isinstance(h, logging.StreamHandler) and any(h.stream is b for b in buffers):
+                try_value(lambda: h.setStream(sys.stderr))
+
+
+def _same_file(a, b):
+    return os.path.normcase(os.path.normpath(a or "")) == os.path.normcase(os.path.normpath(b or ""))
+
+
+def _describe_error(exc, script):
+    """The traceback without this add-in's own frames on top, plus the failing
+    line of the job script. Helper frames below the script stay: they show which
+    helper raised."""
+    if isinstance(exc, SyntaxError) and script and _same_file(exc.filename, script):
+        text = "".join(traceback.format_exception_only(type(exc), exc))
+        return text, {"type": type(exc).__name__, "message": exc.msg, "file": exc.filename,
+                      "line": exc.lineno, "source": (exc.text or "").strip()}
+    tb = exc.__traceback__
+    while tb is not None and _same_file(tb.tb_frame.f_code.co_filename, __file__):
+        tb = tb.tb_next
+    if tb is None:                           # the add-in itself failed: keep everything
+        tb = exc.__traceback__
+    text = "".join(traceback.format_exception(type(exc), exc, tb))
+    frames = traceback.extract_tb(tb)
+    mine = [f for f in frames if script and _same_file(f.filename, script)] or frames[-1:]
+    where = mine[-1] if mine else None
+    error = {"type": type(exc).__name__, "message": str(exc),
+             "file": where.filename if where else None, "line": where.lineno if where else None,
+             "source": (where.line or "").strip() if where else None}
+    return text, error
+
+
+def _record_error(result, exc):
+    result["status"] = "error"
+    if isinstance(exc, JobInputError):       # the job's input was wrong, not the code
+        result["traceback"] = "%s: %s" % (type(exc).__name__, exc)
+        result["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        return
+    try:
+        result["traceback"], result["error"] = _describe_error(exc, result.get("script"))
+    except Exception:                        # describing must never hide the real error
+        result["traceback"] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
 def _execute():
+    global _target
     result = {"id": None, "status": "running", "agent": VERSION}
     t0 = time.time()
     try:
+        result["active_before"] = try_value(lambda: _app.activeDocument.name)
         with io.open(RUNNING, "r", encoding="utf-8-sig") as f:
             job = json.load(f)
         result["id"] = job.get("id")
         result["action"] = job.get("action", "exec_file")
         _run_job(job, result)
         result["status"] = "done"
-    except BaseException:                    # a script calling exit() must not kill the add-in
-        result["status"] = "error"
-        result["traceback"] = traceback.format_exc()
+    except SystemExit as e:                  # exit() / sys.exit(): 0 or None means done
+        if e.code in (None, 0):
+            result["status"] = "done"
+        else:
+            _record_error(result, e)
+    except BaseException as e:               # nothing a script does may kill the add-in
+        _record_error(result, e)
     finally:
+        _target = None                       # a pin never leaks into the next job
+        result["active_after"] = try_value(lambda: _app.activeDocument.name)
         result["seconds"] = round(time.time() - t0, 2)
         try:
             _write_json(RESULT, result)
-        except Exception:
-            pass
+        except Exception as e:               # never leave the client waiting on "running"
+            try:
+                _write_json(RESULT, {"id": result.get("id"), "status": "error", "agent": VERSION,
+                                     "seconds": result["seconds"],
+                                     "traceback": "The result could not be written as JSON: %r" % e,
+                                     "error": {"type": "ResultNotWritten", "message": repr(e)}})
+            except Exception:
+                pass
         try:
             os.replace(RUNNING, DONE)
         except Exception:

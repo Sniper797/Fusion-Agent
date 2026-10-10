@@ -11,7 +11,7 @@ import os
 
 d = design()
 em = d.exportManager
-folder = args.get("folder") or os.path.join(agent_dir, "exports", safe_name(app.activeDocument.name))
+folder = args.get("folder") or os.path.join(agent_dir, "exports", safe_name(doc.name))
 os.makedirs(folder, exist_ok=True)
 levels = {"low": adsk.fusion.MeshRefinementSettings.MeshRefinementLow,
           "medium": adsk.fusion.MeshRefinementSettings.MeshRefinementMedium,

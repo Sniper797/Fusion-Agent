@@ -14,7 +14,7 @@ def body_info(b):
             "material": try_value(lambda: b.material.name)}
 
 
-out["document"] = app.activeDocument.name
+out["document"] = doc.name                  # `doc` follows --doc (add-in 1.1.0+)
 out["units"] = d.unitsManager.defaultLengthUnits
 out["design_type"] = "parametric" if parametric else "direct"
 if parametric:
@@ -24,11 +24,12 @@ out["occurrences"] = [{"name": o.fullPathName, "component": o.component.name,
                        "visible": o.isLightBulbOn,
                        "bodies": [body_info(b) for b in o.bRepBodies]}
                       for o in root.allOccurrences]
-out["joints"] = [{"name": j.name,
+# Joints per component: root.allJoints returned 0 of 111 joints on a direct design.
+out["joints"] = [{"name": j.name, "component": comp.name,
                   "motion": try_value(lambda: j.jointMotion.objectType.split("::")[-1]),
                   "healthy": try_value(lambda: j.healthState ==
                                        adsk.fusion.FeatureHealthStates.HealthyFeatureHealthState)}
-                 for j in root.allJoints]
+                 for comp in d.allComponents for j in comp.joints]
 if parametric:                               # direct designs have no parameters
     out["user_parameters"] = [{"name": p.name, "expression": p.expression} for p in d.userParameters]
 

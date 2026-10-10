@@ -6,9 +6,12 @@ running it inside Fusion through the FusionAgent add-in:
     python run_job.py ping                          # alive? which document is open?
     python run_job.py path/to/script.py --args "{\"key\": 1}"
     python run_job.py path/to/script.py --args-file args.json --timeout 300
+    python run_job.py path/to/script.py --doc "Car"   # run on that open document, not the active one
+    python run_job.py -e "design().timeline.count"    # quick probe, value in out["value"]
+    python run_job.py -c "print(doc.name)"            # code without a file
 
 The script runs on Fusion's main thread. Ready-made names: `app`, `ui`, `adsk`,
-`args` (dict), `out` (dict returned to you), `flush()` (write progress now),
+`args` (dict), `doc` (the pinned or active document), `out` (dict returned to you), `flush()` (write progress now),
 `agent_dir`, `design()`, `find_occurrence(name)`, `bbox_mm(e)`, `mm()`, `cm()`,
 `point_mm(x, y, z)`, `try_value(fn, default)`, `to_component_space(temp_body, occ)`,
 `add_tool_and_combine(comp, body, tool, "cut" | "join" | "intersect", name)`,
@@ -24,11 +27,13 @@ Import standard modules (`os`, `math`, ...) yourself. Working examples are in `e
 4. Edit the way `examples/snap_fit.py` does: build `TemporaryBRepManager` bodies in world space, move them with `to_component_space`, apply them with `add_tool_and_combine`. Call `require_timeline_at_end()`, record `design().timeline.count` before the edit and call `group_timeline(start, name)` after, so the user can delete the whole change in one click.
 5. Prove the edit with numbers: `examples/check_clearance.py` (interference in mm3, minimum gap), `body.isSolid`, joint health. Joints earlier in the timeline stay healthy even when later features cut the faces they reference.
 6. Never save, close or discard the user's documents unless asked. Ask before opening a new document while the user may be working in Fusion.
-7. Paths inside args are `C:/...` style. A Git Bash `/c/...` path fails silently.
+7. Paths inside args are `C:/...` style. run_job.py rewrites Git Bash `/c/...` paths and says so.
 8. Fill an existing hole slightly oversize (+0.05 mm): an exact-radius fill can leave a ~0.1 um slit. `body.volume` carries ~2 ppm noise, so do not chase sub-mm3 differences on large bodies.
 9. Some bodies refuse volume or distance queries (open surfaces, damaged meshes). Wrap such calls in `try_value`.
 10. Pairwise checks grow as n squared. On large assemblies narrow `check_clearance.py` with `only`.
-11. Exit code 3 (busy) is normal when another session shares the add-in: wait and retry. If a job sits in `job.running` and never starts, a modal window is open in Fusion (Scripts and Add-Ins, a save dialog...). Ask the user to close it; never delete another session's job.
-12. Never walk cloud folders inside a job (recursing `app.data` hubs, projects, folders or file properties). It froze Fusion ("Not Responding") for 9 minutes once and about 40 minutes another time, waiting on the network, until the user restarted it. If a file is not open, ask the user to open it. If its path is known, resolve it level by level with `dataFolders.itemByName`.
-13. `design()`, `group_timeline()` and `require_timeline_at_end()` act on the ACTIVE document. Check its name with `ping` before editing. If another session may switch documents, resolve the target from `app.documents` by name and group with that document's own `timeline.timelineGroups`.
+11. Exit code 3 (busy) is normal when another session shares the add-in: wait and retry. If a job sits in `job.running` and never starts, a modal window is open in Fusion (Scripts and Add-Ins, a save dialog...). Ask the user to close it; never delete another session's job. run_job.py names the blocking window after 3 s.
+12. Never walk cloud folders inside a job (recursing `app.data` hubs, projects, folders or file properties). It froze Fusion ("Not Responding") for 9 minutes once and about 40 minutes another time, waiting on the network, until the user restarted it. If a file is not open, ask the user to open it. If its path is known, resolve it level by level with `dataFolders.itemByName`. run_job.py refuses the common forms of such a walk before sending it (exit 5): loops, aliases, helper functions called in loops, recursion. It is a heuristic, so do not rely on it, and never add `--allow cloud-walk` on your own.
+13. Pin every edit with `--doc NAME` (add-in 1.1.0+). `design()`, `doc` and every helper then follow that document even if another session switches tabs, and `save_viewport` refuses when it is not the active one. Without `--doc` everything acts on the ACTIVE document. `ping` lists every document Fusion has loaded, including the ones it loads for referenced parts of an assembly (ARIES: 6 besides its tab; the built-in MCP listed only the tab). `isVisible` was True for all of them, so it does not tell a referenced part from a tab. Never edit a referenced part's document unless the user asked: the change lands in another file they may not have open. A wrong --doc name exits 2.
 14. The joint solver runs after the job ends, so checks inside the job cannot see it. To confirm jointed parts did not move, measure again in a separate job a few seconds later.
+15. Exit code 5: the pre-flight check refused the script. Fix the script instead of adding `--allow`, unless the user agrees. Warnings print before the job runs; read them.
+16. Output longer than 8,000 characters is cut, and the full result's path is printed. Read that file, or return less in `out`.

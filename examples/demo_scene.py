@@ -9,13 +9,16 @@ material. A safe playground for snap_fit.py; other documents are not touched.
 
 Geometry (mm): mount face at y = 0, pin dia 12 x 20 along -Y; part dia 50 x 30
 from y = -2 to -32 with an old bore dia 18 x 10 from its back face.
+Run these steps without --doc and with FUSION_AGENT_DOC unset: the new document is
+the active one, and the other steps work on the active document.
 Close the document without saving when you are done.
 """
 tbm = adsk.fusion.TemporaryBRepManager.get()
 V = adsk.core.Vector3D.create
 
-app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
-d = design()
+new_doc = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
+# The new document's own design, never design(): under --doc that is the pinned document.
+d = adsk.fusion.Design.cast(new_doc.products.itemByProductType("DesignProductType"))
 d.designType = adsk.fusion.DesignTypes.ParametricDesignType
 root = d.rootComponent
 
@@ -48,6 +51,6 @@ cam = app.activeViewport.camera
 cam.isFitView = True
 app.activeViewport.camera = cam
 
-out["document"] = app.activeDocument.name
+out["document"] = new_doc.name
 out["components"] = [o.component.name for o in root.allOccurrences]
 print("demo ready in " + out["document"])

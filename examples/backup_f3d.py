@@ -9,7 +9,7 @@ import os
 import time
 
 d = design()
-name = safe_name(app.activeDocument.name)
+name = safe_name(doc.name)          # `doc` follows --doc (add-in 1.1.0+)
 path = args.get("path") or os.path.join(agent_dir, "backups", name + time.strftime("-%Y%m%d-%H%M%S") + ".f3d")
 os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 
