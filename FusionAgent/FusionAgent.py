@@ -40,7 +40,7 @@ import threading
 import time
 import traceback
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 EVENT_ID = "FusionAgentJobEvent"
 POLL_SEC = 0.05         # how often the watcher looks for a job: a stat call, nothing more
 BEAT_SEC = 1.0          # how often it rewrites alive.json
@@ -350,8 +350,87 @@ def _ping():
             "documents": [_doc_info(d) for d in _open_documents()]}
 
 
-def _fingerprint(doc):
-    """Cheap facts that change when a job edits a document. Counts only: no geometry."""
+def _geometry(d):
+    """Per body: volume (mm3), area (mm2) and centre of mass (mm) from one low-accuracy physical
+    properties call, plus face and edge counts; per occurrence: its placement. The centre moves when
+    a hole slides or a body moves, even when volume and topology stay the same. Low accuracy repeats
+    exactly, so any difference is a real change. Measured: 0.2 s for 633 bodies (ARIES)."""
+    A = adsk.fusion.CalculationAccuracy.LowCalculationAccuracy
+    bodies = {}
+    for comp in d.allComponents:
+        cname = "<root>" if comp == d.rootComponent else try_value(lambda: comp.name, "?")
+        for b in comp.bRepBodies:
+            key = "%s/%s" % (cname, try_value(lambda: b.name, "?"))
+            while key in bodies:
+                key += "'"
+            props = try_value(lambda: b.getPhysicalProperties(A))
+            com = try_value(lambda: props.centerOfMass) if props else None
+            bodies[key] = [try_value(lambda: round(props.volume * 1000, 3)) if props else None,
+                           try_value(lambda: round(props.area * 100, 3)) if props else None,
+                           [round(com.x * 10, 3), round(com.y * 10, 3), round(com.z * 10, 3)] if com else None,
+                           try_value(lambda: [b.faces.count, b.edges.count])]
+    placements = {}
+    for o in d.rootComponent.allOccurrences:
+        m = try_value(lambda: o.transform2.asArray())
+        name = try_value(lambda: o.fullPathName)
+        if m and name:
+            placements[name] = [round(m[i], 6) for i in (0, 1, 2, 4, 5, 6, 8, 9, 10)] + \
+                               [round(m[i] * 10, 3) for i in (3, 7, 11)]
+    return {"bodies": bodies, "placements": placements}
+
+
+def _geometry_diff(gb, ga, limit=30):
+    """What moved or changed shape, in words a person can check in Fusion."""
+    if not gb or not ga:                     # one side could not be measured: say so, never "all removed"
+        return {"not_measured": ["the geometry could not be measured %s the job" % ("before" if not gb else "after")]}
+    out_ = {}
+    bb, ba = gb.get("bodies", {}), ga.get("bodies", {})
+    added = sorted(set(ba) - set(bb))
+    removed = sorted(set(bb) - set(ba))
+    renamed = []
+    for r in list(removed):                  # same body under a new name: a rename, not a loss and a gain
+        twin = next((a for a in added if ba[a] == bb[r]), None)
+        if twin:
+            renamed.append("%s -> %s" % (r, twin))
+            removed.remove(r)
+            added.remove(twin)
+    changed = []
+    for k in sorted(set(bb) & set(ba)):
+        (v0, s0, c0, n0), (v1, s1, c1, n1) = bb[k], ba[k]
+        what = []
+        if v0 is not None and v1 is not None and abs(v1 - v0) > 1e-3:
+            what.append("volume %s -> %s mm3" % (v0, v1))
+        if s0 is not None and s1 is not None and abs(s1 - s0) > 1e-3:
+            what.append("area %s -> %s mm2" % (s0, s1))
+        if n0 != n1:
+            what.append("faces/edges %s -> %s" % (n0, n1))
+        if c0 and c1:
+            shift = [round(y - x, 3) for x, y in zip(c0, c1)]
+            if max(abs(x) for x in shift) > 1e-3:
+                what.append(("moved %s mm in its component" if not what else "centre moved %s mm") % shift)
+        if what:
+            changed.append("%s: %s" % (k, "; ".join(what)))
+    pb, pa = gb.get("placements", {}), ga.get("placements", {})
+    moved = []
+    for k in sorted(set(pb) & set(pa)):
+        a, b = pb[k], pa[k]
+        shift = [round(y - x, 3) for x, y in zip(a[9:], b[9:])]
+        turned = max(abs(x - y) for x, y in zip(a[:9], b[:9])) > 1e-5
+        if turned or max(abs(x) for x in shift) > 1e-3:
+            moved.append("%s: moved %s mm%s" % (k, shift, ", turned" if turned else ""))
+    parts_added = ["%s at %s mm" % (k, pa[k][9:]) for k in sorted(set(pa) - set(pb))]
+    parts_removed = ["%s (was at %s mm)" % (k, pb[k][9:]) for k in sorted(set(pb) - set(pa))]
+    for name, items in (("bodies_added", added), ("bodies_removed", removed), ("bodies_renamed", renamed),
+                        ("bodies_changed", changed), ("parts_moved", moved), ("parts_added", parts_added),
+                        ("parts_removed", parts_removed)):
+        if items:
+            out_[name] = items[:limit] + (["... and %d more" % (len(items) - limit)] if len(items) > limit else [])
+    return out_
+
+
+def _fingerprint(doc, geometry=False):
+    """Cheap facts that change when a job edits a document: counts, and with geometry=True the
+    shape and placement of every body (see _geometry)."""
     info = {"isModified": try_value(lambda: doc.isModified)}
     d = try_value(lambda: adsk.fusion.Design.cast(doc.products.itemByProductType("DesignProductType")))
     if d is not None:
@@ -362,6 +441,8 @@ def _fingerprint(doc):
             info["timeline"] = try_value(lambda: [d.timeline.count, d.timeline.markerPosition])
             info["parameters"] = try_value(lambda: sorted("%s=%s" % (p.name, p.expression)
                                                           for p in d.userParameters))
+        if geometry:
+            info["geometry"] = try_value(lambda: _geometry(d))
     return info
 
 
@@ -370,16 +451,16 @@ def _doc_key(doc):
     return try_value(lambda: doc.creationId) or try_value(lambda: doc.name)
 
 
-def _snapshot():
+def _snapshot(geometry=False):
     """The open documents, the active one, and fingerprints of the active and the pinned one,
     all keyed by creationId. A document the job closed is simply missing afterwards."""
     active = _app.activeDocument
     docs = {}
-    for d in (active, _target):
+    for d in {_doc_key(x): x for x in (active, _target) if x is not None}.values():   # once, if pinned to the active
         key = _doc_key(d) if d is not None else None
         name = try_value(lambda: d.name) if d is not None else None
         if key is not None and name is not None:
-            docs[key] = dict(_fingerprint(d), name=name)
+            docs[key] = dict(_fingerprint(d, geometry), name=name)
     open_docs = {}
     for d in _open_documents():
         key, name = _doc_key(d), try_value(lambda d=d: d.name)
@@ -408,6 +489,13 @@ def _diff(before, after):
             continue                         # closed: reported above
         delta = {k: [fb.get(k), fa.get(k)] for k in sorted(set(fb) | set(fa))
                  if k != "name" and fb.get(k) != fa.get(k)}
+        gb, ga = fb.get("geometry", False), fa.get("geometry", False)   # False: not asked; None: failed
+        if gb is not False or ga is not False:
+            delta.pop("geometry", None)
+            if gb != ga or not gb or not ga:
+                g = _geometry_diff(gb or None, ga or None)
+                if g:
+                    delta["geometry"] = g
         if "parameters" in delta:            # say which, not the whole list twice
             b, a = set(delta["parameters"][0] or []), set(delta["parameters"][1] or [])
             delta["parameters"] = {"removed": sorted(b - a), "added": sorted(a - b)}
@@ -438,6 +526,9 @@ def _run_job(job, result):
 
     cancel_file = os.path.join(CANCEL, str(job.get("id")))
 
+    if os.path.exists(cancel_file):          # cancelled while it waited (in line, or behind a window)
+        raise JobCancelled("cancelled before it started")
+
     def check_cancel():
         """Stop here if this job was cancelled (run_job.py cancel, Ctrl+C, or its client timed out)."""
         if os.path.exists(cancel_file):
@@ -459,7 +550,8 @@ def _run_job(job, result):
                   "args": job.get("args") or {}, "out": out, "flush": flush,
                   "agent_dir": AGENT_DIR, "check_cancel": check_cancel})
     t = time.time()
-    before = try_value(_snapshot) if job.get("receipt", True) else None
+    full = job.get("receipt") == "full"
+    before = try_value(lambda: _snapshot(full)) if job.get("receipt", True) else None
     receipt_s = time.time() - t
     flush()
     try:
@@ -473,7 +565,7 @@ def _run_job(job, result):
         result["stderr"] = err.getvalue()[-STDOUT_KEEP:]
         if before is not None:
             t = time.time()
-            after = try_value(_snapshot)
+            after = try_value(lambda: _snapshot(full))
             result["changes"] = try_value(lambda: _diff(before, after)) if after else None
             result["receipt_ms"] = round((receipt_s + time.time() - t) * 1000, 1)
     if job.get("read_only") and result.get("changes"):
@@ -636,7 +728,7 @@ class _Watcher(threading.Thread):
                     os.makedirs(AGENT_DIR, exist_ok=True)     # survives the folder being deleted
                     _write_json(BEAT, {"t": now, "pid": os.getpid(), "agent": VERSION,
                                        "sha": SELF_SHA, "file": __file__,
-                                       "features": ["doc", "queue", "receipt", "cancel"]})
+                                       "features": ["doc", "queue", "receipt", "cancel", "full-receipt"]})
                     last_beat = now
                 if os.path.isfile(RUNNING):
                     continue

@@ -80,7 +80,7 @@ python run_job.py cancel <job id>
 - **If the script fails,** it prints the error with your script's own lines only, plus a hint when it matches a known trap.
 - **`api`** searches the Fusion API documentation installed on your computer, without contacting Fusion: the method, its signature and its description. About 3 s the first time to build the index, then under a second.
 - **The job id** is on the line starting with `job`. To stop a job: `cancel` with that id, or Ctrl+C.
-  - **Queued:** it is dropped and never runs.
+  - **Queued:** it is dropped and never runs. On Windows, Ctrl+Break works like Ctrl+C.
   - **Running:** it stops at its next `flush()` or `check_cancel()` and returns what it got to.
   - **Timeout before it started** (a window holding Fusion, say): it is cancelled, so it never runs later with nobody waiting.
   - **Timeout while it runs:** it is stopped only with `--cancel-on-timeout`, because an edit stopped halfway leaves half a change.
@@ -123,6 +123,8 @@ With add-in 1.2.0 or newer:
 - **Speed:** the add-in checks the folder every 0.05 s instead of 0.5. A tiny job from the terminal went from 0.49 s to 0.13 s, and the protocol alone from 0.51 s to 0.06 s. A check pass costs about 0.1% of one core.
 - **Change receipt:** after every job, `run_job.py` prints what changed in the active and the pinned document: a document opened or closed, the active document, the modified flag, the timeline's length and marker, components, bodies and user parameters. When nothing did, it says `changes: none seen`.
 - **The receipt's limits:** it counts things; it does not compare geometry. Moving a part, or changing a dimension inside a feature without adding anything, may show only as the modified flag. `--no-receipt` skips it.
+- **`--full-receipt`** (add-in 1.4.0): also compares every body's volume, surface area, face and edge counts and centre of mass, and every part's placement in the assembly. The centre of mass catches what changes no volume and no count: a hole that slid, a body moved inside its component. On ARIES it caught a body moved 3 mm inside its component, a cube cut from the edge of another (-62.5 mm3, +50 mm2, +5 faces, centre moved 0.024 mm) and a part moved 5 mm. It costs 0.4 s per job on a 633-body assembly, so it is opt-in.
+- **What the receipt cannot see:** the joint solver runs after the job ends, so a part moved by a joint does not show in that job's receipt. To be sure, measure again in a separate job a few seconds later.
 - **`--read-only`:** if the receipt sees any change, the job fails with exit code 6. This detects after the fact; it undoes nothing.
 - **Journal:** every finished job adds a line to `journal.jsonl` in the add-in's folder: who sent it (folder and process), which script, on which document, what changed, and the error type. Useful when several sessions share the add-in.
 
@@ -187,7 +189,8 @@ python run_job.py examples/laser_dxf.py --args "{\"kerf_mm\": 0.1}"
 - **`kerf_mm`:** bakes the cut width into the files, the Center's way: outlines move out and holes in by half of it, with Fusion's own wire offset, and sharp corners stay sharp. Set the laser's offset to 0. A 20 mm square coupon comes with it: cut it first and measure it; real kerf = 20 + `kerf_mm` - your reading. Then it measures the distance from every moved loop to the model's curves: on ARIES with 0.10, the median and the minimum were exactly 0.050 mm.
 - **Orientation:** each part is drawn from its face that looks out of the assembly, so it never comes out mirrored. A standing or sloping panel is drawn upright as in the model, with the modeling up from your Fusion preferences as up. If the model was made the other way, pass `up`, e.g. `[0, 1, 0]`.
 - **`demo`:** builds three shapes in memory, so you can try it without any design.
-- **Not done yet:** nesting that saves material: the rows are a check that parts fit the bed more than a layout.
+- **Layout on the sheet (`layout`):** `maxrects` by default: each part, biggest first, goes where it fills the free space most snugly, turned 90 degrees when that fits better. On 200 random sets it needed 29% fewer sheets than rows (317 against 445). `rows` gives the old rows back. Each sheet reports how much of it is material, from the parts' real area, not their rectangles (`material_of_bed_pct`, and `material_of_used_area_pct` for the part of the bed in use).
+- **Not done yet:** packing by the parts' true outlines. Parts are packed by their bounding rectangles, so an L-shaped part reserves its whole rectangle.
 
 ## Write your own script
 

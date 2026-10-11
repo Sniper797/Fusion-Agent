@@ -21,6 +21,9 @@ args:
     bed            [width, height] of the laser bed in mm (default [1300, 900])
     gap            mm between parts on a sheet (default 5)
     max_thickness  thicker parts are skipped, in mm (default 20)
+    layout         maxrects (default): each part, biggest first, in the free space it fills most snugly,
+                   turned 90 degrees when that fits better | rows: simple rows, the old way.
+                   Parts are packed by their bounding rectangles, not their true outlines.
     up             [x, y, z]: the model's up, when it is not your Fusion preference's (Y or Z up).
                    Standing panels are drawn with this up pointing up.
     kerf_mm        the laser's cut width, baked into the files (default 0: no offset). Outlines
@@ -29,7 +32,8 @@ args:
                    measure it, and real kerf = 20 + kerf_mm - your reading.
     demo           true: export three built-in test shapes instead of the design
 
-Not done here: real nesting (the sheets are simple rows, a fit check more than a layout).
+Not done here: true-shape nesting. Parts are packed by their bounding rectangles, so an L-shaped
+part reserves its whole rectangle.
 """
 import math
 import os
@@ -46,6 +50,10 @@ exclude = [x.lower() for x in args.get("exclude") or []]
 sheet_mm = {k.lower(): float(v) for k, v in (args.get("sheet_mm") or {}).items()}
 PRISM_TOL = 0.002          # volume may differ from outline area x thickness by 0.2 %, no more
 kerf = float(args.get("kerf_mm", 0))
+layout = args.get("layout", "maxrects")
+if layout not in ("maxrects", "rows"):                    # say so now, not after every part is exported
+    raise ValueError("layout must be maxrects or rows, not %r" % layout)
+tick = globals().get("check_cancel") or (lambda: None)  # add-in 1.3.0+: a cancel stops a long packing too
 tag = (" kerf%.2f-offset0" % kerf).replace(".", "p") if kerf > 0 else ""   # the Center's file naming
 
 
@@ -453,27 +461,98 @@ if kerf > 0:                                                  # cut this first, 
     out["coupon"] = {"file": os.path.basename(coupon), "drawn_mm": round(side, 3),
                      "how": "cut it first and measure it: real kerf = %.2f - your reading (mm)" % side}
 
-# Sheets: one set per thickness, parts in rows, turned 90 degrees when that is what fits.
+# ---------------------------------------------------------------- the sheets
+# Both packers are plain Python (no Fusion), so tests can run them. Each returns, per part, None
+# when it does not fit the bed, else (page, x, y, turned 90 degrees).
+
+def pack_rows(sizes, W, H, gap, tick=None):
+    """Rows, longest part first: simple, wasteful."""
+    places, page, x, y, row_h = [None] * len(sizes), 0, gap, gap, 0.0
+    for i in sorted(range(len(sizes)), key=lambda i: -max(sizes[i])):
+        w, h = sizes[i]
+        turn = False
+        if (w > W - 2 * gap or h > H - 2 * gap) and h <= W - 2 * gap and w <= H - 2 * gap:
+            w, h, turn = h, w, True
+        if w > W - 2 * gap or h > H - 2 * gap:
+            continue
+        if x + w > W - gap:
+            x, y, row_h = gap, y + row_h + gap, 0.0
+        if y + h > H - gap:
+            page, x, y, row_h = page + 1, gap, gap, 0.0
+        places[i] = (page, x, y, turn)
+        x, row_h = x + w + gap, max(row_h, h)
+        if tick:
+            tick()
+    return places
+
+
+def contains(a, b):
+    return a[0] <= b[0] and a[1] <= b[1] and a[0] + a[2] >= b[0] + b[2] and a[1] + a[3] >= b[1] + b[3]
+
+
+def split_free(free, used):
+    """MaxRects bookkeeping: cut the used rectangle out of every free one it touches."""
+    ux, uy, uw, uh = used
+    pieces = []
+    for f in free:
+        fx, fy, fw, fh = f
+        if ux >= fx + fw or ux + uw <= fx or uy >= fy + fh or uy + uh <= fy:
+            pieces.append(f)
+            continue
+        if ux > fx:
+            pieces.append((fx, fy, ux - fx, fh))
+        if ux + uw < fx + fw:
+            pieces.append((ux + uw, fy, fx + fw - ux - uw, fh))
+        if uy > fy:
+            pieces.append((fx, fy, fw, uy - fy))
+        if uy + uh < fy + fh:
+            pieces.append((fx, uy + uh, fw, fy + fh - uy - uh))
+    return [a for i, a in enumerate(pieces)
+            if not any(j != i and contains(b, a) and (b != a or j < i) for j, b in enumerate(pieces))]
+
+
+def pack_maxrects(sizes, W, H, gap, tick=None):
+    """MaxRects, best short side fit, with 90-degree turns: each part, biggest first, goes to the free
+    rectangle it fills most snugly on the earliest sheet it fits. Each part claims its size plus
+    `gap`, and the sheet keeps `gap` all round."""
+    BW, BH = W - gap, H - gap
+    places, pages = [None] * len(sizes), []
+    for i in sorted(range(len(sizes)), key=lambda i: -(sizes[i][0] * sizes[i][1])):
+        w, h = sizes[i][0] + gap, sizes[i][1] + gap
+        if not ((w <= BW and h <= BH) or (h <= BW and w <= BH)):
+            continue
+        best = None
+        for pg, free in enumerate(pages + [[(0.0, 0.0, BW, BH)]]):
+            for fx, fy, fw, fh in free:
+                for ww, hh, turn in ((w, h, False), (h, w, True)):
+                    if ww <= fw + 1e-9 and hh <= fh + 1e-9:
+                        score = (min(fw - ww, fh - hh), max(fw - ww, fh - hh))
+                        if best is None or score < best[0]:
+                            best = (score, pg, fx, fy, ww, hh, turn)
+            if best is not None:
+                break                                  # the earliest sheet that takes it
+        _, pg, x, y, ww, hh, turn = best
+        if pg == len(pages):
+            pages.append([(0.0, 0.0, BW, BH)])
+        pages[pg] = split_free(pages[pg], (x, y, ww, hh))
+        places[i] = (pg, x + gap, y + gap, turn)
+        if tick:
+            tick()
+    return places
+
+
+packer = {"maxrects": pack_maxrects, "rows": pack_rows}[layout]
 sheets = []
 for t in sorted({p["sheet_mm"] for p in parts}):          # the sheet it is cut from, not the model
-    group = sorted((p for p in parts if p["sheet_mm"] == t), key=lambda p: -max(p["_w"], p["_h"]))
-    pages, x, y, row_h = [[]], gap, gap, 0.0
-    for p in group:
-        w, h, turn = p["_w"], p["_h"], False
-        if (w > bed_w - 2 * gap or h > bed_h - 2 * gap) and h <= bed_w - 2 * gap and w <= bed_h - 2 * gap:
-            w, h, turn = h, w, True
-        if w > bed_w - 2 * gap or h > bed_h - 2 * gap:
-            p["fits_bed"] = False
-            continue
-        p["fits_bed"] = True
-        if x + w > bed_w - gap:
-            x, y, row_h = gap, y + row_h + gap, 0.0
-        if y + h > bed_h - gap:
-            pages.append([])
-            x, y, row_h = gap, gap, 0.0
-        pages[-1].append((p, x, y, turn))
-        x, row_h = x + w + gap, max(row_h, h)
-    for i, page in enumerate(p_ for p_ in pages if p_):
+    group = [p for p in parts if p["sheet_mm"] == t]
+    places = packer([(p["_w"], p["_h"]) for p in group], bed_w, bed_h, gap, tick)
+    pages = {}
+    for p, place in zip(group, places):
+        p["fits_bed"] = place is not None
+        if place is not None:
+            pages.setdefault(place[0], []).append((p, place[1], place[2], place[3]))
+    pages = [pages[k] for k in sorted(pages)]
+    for i, page in enumerate(pages):
         ents = []
         for p, px, py, turn in page:
             e = p["_ents"]
@@ -485,9 +564,14 @@ for t in sorted({p["sheet_mm"] for p in parts}):          # the sheet it is cut 
         path = os.path.join(folder, "sheet %.2fmm %d of %d%s.dxf" % (t, i + 1, len([q for q in pages if q]), tag))
         write_dxf(path, ents)
         used = max(bounds(ents)[2], 1), max(bounds(ents)[3], 1)
+        material = sum(p["area_mm2"] for p, _, _, _ in page)    # the parts' real area, holes out, not their boxes
         sheets.append({"file": os.path.basename(path), "thickness_mm": t, "parts": len(page),
-                       "used_mm": [round(used[0], 1), round(used[1], 1)], "entities": read_back(path)})
+                       "used_mm": [round(used[0], 1), round(used[1], 1)],
+                       "material_of_bed_pct": round(100 * material / (bed_w * bed_h), 1),
+                       "material_of_used_area_pct": round(100 * material / (used[0] * used[1]), 1),
+                       "entities": read_back(path)})
 out["sheets"] = sheets
+out["layout"] = layout
 out["bed_mm"] = [bed_w, bed_h]
 for p in parts:
     for k in ("_ents", "_w", "_h"):

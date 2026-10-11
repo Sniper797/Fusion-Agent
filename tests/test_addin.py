@@ -154,6 +154,63 @@ class Receipts(unittest.TestCase):
         self.assertNotIn("documents", d)
 
 
+class GeometryReceipt(unittest.TestCase):
+    """Body entries are [volume mm3, area mm2, centre of mass mm, [faces, edges]]."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fa = load_addin(tempfile.mkdtemp(prefix="fa_test_"))
+
+    def g(self, bodies=None, placements=None):
+        return {"bodies": bodies or {}, "placements": placements or {}}
+
+    def test_nothing_changed(self):
+        g = self.g({"Plate/Body1": [1000.0, 700.0, [5, 5, 1], [6, 12]]}, {"Plate:1": [1] * 9 + [0, 0, 0]})
+        self.assertEqual(self.fa._geometry_diff(g, json.loads(json.dumps(g))), {})
+
+    def test_cut_added_body_moved_part(self):
+        before = self.g({"Plate/Body1": [1000.0, 700.0, [5, 5, 1], [6, 12]], "Old/Body1": [5.0, 3.0, [1, 1, 1], [6, 12]]},
+                        {"Ear:1": [1, 0, 0, 0, 1, 0, 0, 0, 1, 10.0, 0.0, 0.0]})
+        after = self.g({"Plate/Body1": [990.0, 710.0, [5.1, 5, 1], [7, 15]], "New/Body1": [2.0, 1.0, [9, 9, 9], [6, 12]]},
+                       {"Ear:1": [1, 0, 0, 0, 1, 0, 0, 0, 1, 15.0, 0.0, 0.0]})
+        d = self.fa._geometry_diff(before, after)
+        self.assertEqual(d["bodies_added"], ["New/Body1"])
+        self.assertEqual(d["bodies_removed"], ["Old/Body1"])
+        self.assertEqual(d["bodies_changed"], ["Plate/Body1: volume 1000.0 -> 990.0 mm3; area 700.0 -> 710.0 mm2; "
+                                               "faces/edges [6, 12] -> [7, 15]; centre moved [0.1, 0, 0] mm"])
+        self.assertEqual(d["parts_moved"], ["Ear:1: moved [5.0, 0.0, 0.0] mm"])
+
+    def test_hole_slid_same_volume_and_topology(self):
+        # A review found this missed by the first version: only the centre of mass moves.
+        before = self.g({"Plate/Body1": [1000.0, 700.0, [50.0, 30.0, 1.35], [7, 15]]})
+        after = self.g({"Plate/Body1": [1000.0, 700.0, [49.8, 30.0, 1.35], [7, 15]]})
+        self.assertEqual(self.fa._geometry_diff(before, after)["bodies_changed"],
+                         ["Plate/Body1: moved [-0.2, 0.0, 0.0] mm in its component"])
+
+    def test_rename_is_not_a_loss(self):
+        body = [1000.0, 700.0, [5, 5, 1], [6, 12]]
+        d = self.fa._geometry_diff(self.g({"Old/Body1": body}), self.g({"New/Body1": list(body)}))
+        self.assertEqual(d, {"bodies_renamed": ["Old/Body1 -> New/Body1"]})
+
+    def test_parts_added_and_removed(self):
+        before = self.g(placements={"Bolt:1": [1] * 9 + [0, 0, 0], "Bolt:3": [1] * 9 + [50, 0, 0]})
+        after = self.g(placements={"Bolt:1": [1] * 9 + [0, 0, 0], "Bolt:4": [1] * 9 + [80, 0, 0]})
+        d = self.fa._geometry_diff(before, after)
+        self.assertEqual(d["parts_added"], ["Bolt:4 at [80, 0, 0] mm"])
+        self.assertEqual(d["parts_removed"], ["Bolt:3 (was at [50, 0, 0] mm)"])
+
+    def test_not_measured_is_said_not_turned_into_removals(self):
+        g = self.g({"P/B": [1.0, 1.0, [0, 0, 0], [6, 12]]})
+        self.assertEqual(list(self.fa._geometry_diff(g, None)), ["not_measured"])
+
+    def test_placement_noise_is_not_a_move_but_a_turn_is(self):
+        before = self.g(placements={"P:1": [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]})
+        noise = self.g(placements={"P:1": [0.999999, 0, 0, 0, 1, 0, 0, 0, 1, 0.0004, 0, 0]})
+        turn = self.g(placements={"P:1": [0, -1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0]})
+        self.assertEqual(self.fa._geometry_diff(before, noise), {})
+        self.assertEqual(self.fa._geometry_diff(before, turn)["parts_moved"], ["P:1: moved [0, 0, 0] mm, turned"])
+
+
 class Json(unittest.TestCase):
     def test_tuple_keys_survive(self):
         fa = load_addin(tempfile.mkdtemp(prefix="fa_test_"))

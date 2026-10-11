@@ -37,14 +37,16 @@ import ast
 import json
 import os
 import re
+import signal
 import sys
 import time
 import uuid
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 NEEDS_FOR_DOC = (1, 1, 0)
 NEEDS_FOR_QUEUE = (1, 2, 0)
 NEEDS_FOR_CANCEL = (1, 3, 0)
+NEEDS_FOR_FULL_RECEIPT = (1, 4, 0)
 KEEP_SECONDS = 2 * 24 * 3600        # inline scripts and saved results older than this are swept
 
 # ------------------------------------------------------------- pre-flight check
@@ -626,11 +628,13 @@ def wait_for(d, job, timeout, pid, quiet=False):
     return last, False
 
 
-def print_changes(changes):
+def print_changes(changes, full=False):
     if changes is None:
         return
     if not changes:
-        print("changes: none seen (open documents, modified flag, timeline, components, bodies, parameters)")
+        print("changes: none seen (open documents, modified flag, timeline, components, bodies, parameters%s)"
+              % (", and every body's volume, area, faces, edges and centre of mass, every part's placement"
+                 if full else ""))
         return
     print("--- changes ---")
     for key in ("opened", "closed"):
@@ -640,12 +644,18 @@ def print_changes(changes):
         print("active document: %s -> %s" % tuple(changes["active"]))
     for name, delta in (changes.get("documents") or {}).items():
         parts = []
+        geometry = delta.pop("geometry", None)
         for field, v in delta.items():
             if field == "parameters":
                 parts.append("parameters added %s, removed %s" % (v.get("added"), v.get("removed")))
             else:
                 parts.append("%s %s -> %s" % (field, v[0], v[1]))
-        print("%s: %s" % (name, "; ".join(parts)))
+        if parts:
+            print("%s: %s" % (name, "; ".join(parts)))
+        for what, items in (geometry or {}).items():
+            print("%s, %s:" % (name, what.replace("_", " ")))
+            for item in items:
+                print("    " + item)
 
 
 def doctor(d):
@@ -736,11 +746,17 @@ def doctor(d):
     return 2
 
 
+def _interrupt(*_):
+    raise KeyboardInterrupt
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+    if hasattr(signal, "SIGBREAK"):           # Windows: Ctrl+Break, and what other programs send, acts as Ctrl+C
+        signal.signal(signal.SIGBREAK, _interrupt)
     p = argparse.ArgumentParser(description="Run a Python script inside Autodesk Fusion via FusionAgent.")
     p.add_argument("script", nargs="?", help='a .py file to run inside Fusion, or: ping, doctor, api WORD...')
     p.add_argument("words", nargs="*", help="for api: words to look up in the installed Fusion API")
@@ -754,6 +770,9 @@ def main():
     p.add_argument("--read-only", action="store_true",
                    help="fail (exit 6) when the job changes anything the receipt can see; nothing is undone")
     p.add_argument("--no-receipt", action="store_true", help="skip the before/after check of the documents")
+    p.add_argument("--full-receipt", action="store_true",
+                   help="also compare every body's volume, area, faces, edges and centre of mass, and every part's "
+                        "placement (about 0.4 s per job on a 633-body assembly)")
     p.add_argument("--timeout", type=float, default=120, help="seconds to wait, in line and running (default 120)")
     p.add_argument("--cancel-on-timeout", action="store_true",
                    help="when --timeout runs out while the job runs, stop it at its next flush() (an edit may be left half done)")
@@ -798,6 +817,10 @@ def main():
         print("Run python install.py, then in Fusion (Shift+S) stop FusionAgent and run it again.")
         return 2
     queued = version_tuple(installed) >= NEEDS_FOR_QUEUE
+    if a.full_receipt and version_tuple(installed) < NEEDS_FOR_FULL_RECEIPT:
+        print("--full-receipt needs FusionAgent 1.4.0 or newer, and the installed add-in is %s." % installed)
+        print("Run python install.py, then in Fusion (Shift+S) stop FusionAgent and run it again.")
+        return 2
     if a.read_only and not queued:
         print("--read-only needs FusionAgent 1.2.0 or newer, and the installed add-in is %s." % installed)
         print("Run python install.py, then in Fusion (Shift+S) stop FusionAgent and run it again.")
@@ -879,6 +902,8 @@ def main():
             job["read_only"] = True
         if a.no_receipt:
             job["receipt"] = False
+        elif a.full_receipt:
+            job["receipt"] = "full"
 
     if queued:
         job["expires"] = time.time() + a.timeout + 5          # dropped unrun if we have stopped waiting
@@ -974,7 +999,7 @@ def main():
     if cut_any:
         print("--- full result: %s ---" % full)
     if last.get("action") != "ping" and last.get("status") != "running":
-        print_changes(last.get("changes"))
+        print_changes(last.get("changes"), full=bool(a.full_receipt))
     if last.get("status") == "error":
         print("--- error ---")
         print(last.get("traceback", "").rstrip())
