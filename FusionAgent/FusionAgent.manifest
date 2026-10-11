@@ -6,7 +6,7 @@
     "description": {
         "": "Runs Python jobs dropped into a folder and writes the result back as JSON, so another program or an AI agent can drive Fusion."
     },
-    "version": "1.4.0",
+    "version": "1.5.0",
     "runOnStartup": true,
     "supportedOS": "windows|mac",
     "editEnabled": true

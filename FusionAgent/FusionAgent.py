@@ -11,7 +11,9 @@ Folder (override with the FUSION_AGENT_DIR environment variable):
 Files in that folder:
     queue/<ns>-<id>.json   waiting jobs (1.2.0+), run oldest first:
                  {"id", "action": "exec_file" | "ping", "path", "args", "doc", "expires",
-                  "read_only", "receipt", "caller"}. A job whose "expires" has passed is
+                  "read_only", "receipt", "receipt_max_bodies", "caller"}. "receipt": true
+                 (counts), "full" (counts and geometry, skipped in a design over
+                 receipt_max_bodies bodies) or false. A job whose "expires" has passed is
                  dropped unrun: its client has stopped waiting.
     job.json     the single job slot that 1.0/1.1 clients use; still served first
     job.running  the job being executed (claimed by renaming)
@@ -40,7 +42,7 @@ import threading
 import time
 import traceback
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 EVENT_ID = "FusionAgentJobEvent"
 POLL_SEC = 0.05         # how often the watcher looks for a job: a stat call, nothing more
 BEAT_SEC = 1.0          # how often it rewrites alive.json
@@ -428,9 +430,10 @@ def _geometry_diff(gb, ga, limit=30):
     return out_
 
 
-def _fingerprint(doc, geometry=False):
+def _fingerprint(doc, geometry=False, max_bodies=None):
     """Cheap facts that change when a job edits a document: counts, and with geometry=True the
-    shape and placement of every body (see _geometry)."""
+    shape and placement of every body (see _geometry). A design with more than max_bodies bodies
+    keeps its counts only and says how many bodies it skipped."""
     info = {"isModified": try_value(lambda: doc.isModified)}
     d = try_value(lambda: adsk.fusion.Design.cast(doc.products.itemByProductType("DesignProductType")))
     if d is not None:
@@ -442,7 +445,11 @@ def _fingerprint(doc, geometry=False):
             info["parameters"] = try_value(lambda: sorted("%s=%s" % (p.name, p.expression)
                                                           for p in d.userParameters))
         if geometry:
-            info["geometry"] = try_value(lambda: _geometry(d))
+            n = info.get("bodies")
+            if max_bodies is not None and n is not None and n > max_bodies:
+                info["geometry_skipped"] = n
+            else:
+                info["geometry"] = try_value(lambda: _geometry(d))
     return info
 
 
@@ -451,16 +458,18 @@ def _doc_key(doc):
     return try_value(lambda: doc.creationId) or try_value(lambda: doc.name)
 
 
-def _snapshot(geometry=False):
+def _snapshot(geometry=False, max_bodies=None, only=None):
     """The open documents, the active one, and fingerprints of the active and the pinned one,
-    all keyed by creationId. A document the job closed is simply missing afterwards."""
+    all keyed by creationId. A document the job closed is simply missing afterwards.
+    geometry: measure shapes, in documents up to max_bodies bodies, or only in the keys in `only`."""
     active = _app.activeDocument
     docs = {}
     for d in {_doc_key(x): x for x in (active, _target) if x is not None}.values():   # once, if pinned to the active
         key = _doc_key(d) if d is not None else None
         name = try_value(lambda: d.name) if d is not None else None
         if key is not None and name is not None:
-            docs[key] = dict(_fingerprint(d, geometry), name=name)
+            measure = geometry and (only is None or key in only)
+            docs[key] = dict(_fingerprint(d, measure, max_bodies), name=name)
     open_docs = {}
     for d in _open_documents():
         key, name = _doc_key(d), try_value(lambda d=d: d.name)
@@ -470,9 +479,10 @@ def _snapshot(geometry=False):
             "docs": docs}
 
 
-def _diff(before, after):
+def _diff(before, after, notes=None):
     """What differs between two snapshots; {} when nothing visible changed. Names label the
-    documents, keys tell them apart."""
+    documents, keys tell them apart. Geometry that could not be measured goes to notes, not to the
+    changes: unknown is not changed, and must not fail a --read-only job on its own."""
     changes = {}
     opened = [after["open"][k] for k in after["open"] if k not in before["open"]]
     closed = [before["open"][k] for k in before["open"] if k not in after["open"]]
@@ -488,12 +498,16 @@ def _diff(before, after):
         if fa is None:
             continue                         # closed: reported above
         delta = {k: [fb.get(k), fa.get(k)] for k in sorted(set(fb) | set(fa))
-                 if k != "name" and fb.get(k) != fa.get(k)}
+                 if k not in ("name", "geometry_skipped") and fb.get(k) != fa.get(k)}
         gb, ga = fb.get("geometry", False), fa.get("geometry", False)   # False: not asked; None: failed
         if gb is not False or ga is not False:
             delta.pop("geometry", None)
-            if gb != ga or not gb or not ga:
-                g = _geometry_diff(gb or None, ga or None)
+            if not gb or not ga:
+                if notes is not None:
+                    notes.setdefault("not_measured", []).append(
+                        "%s (%s the job)" % (fa.get("name") or fb.get("name") or key, "before" if not gb else "after"))
+            elif gb != ga:
+                g = _geometry_diff(gb, ga)
                 if g:
                     delta["geometry"] = g
         if "parameters" in delta:            # say which, not the whole list twice
@@ -502,6 +516,19 @@ def _diff(before, after):
         if delta:
             changes.setdefault("documents", {})[fa.get("name") or fb.get("name") or key] = delta
     return changes
+
+
+def _geometry_summary(before, after, notes):
+    """For a full receipt: which documents had their geometry compared, which were skipped as
+    too big (name: bodies), and which could not be measured."""
+    s = {"compared": [], "skipped": {}, "not_measured": list(notes.get("not_measured", []))}
+    for key, fb in before["docs"].items():
+        fa = ((after or {}).get("docs") or {}).get(key) or {}
+        if "geometry_skipped" in fb:
+            s["skipped"][fb.get("name") or key] = fb["geometry_skipped"]
+        elif fb.get("geometry") and fa.get("geometry"):
+            s["compared"].append(fa.get("name") or fb.get("name") or key)
+    return s
 
 
 def _run_job(job, result):
@@ -551,7 +578,9 @@ def _run_job(job, result):
                   "agent_dir": AGENT_DIR, "check_cancel": check_cancel})
     t = time.time()
     full = job.get("receipt") == "full"
-    before = try_value(lambda: _snapshot(full)) if job.get("receipt", True) else None
+    cap = job.get("receipt_max_bodies")
+    cap = cap if isinstance(cap, int) and not isinstance(cap, bool) and cap >= 0 else None
+    before = try_value(lambda: _snapshot(full, cap)) if job.get("receipt", True) else None
     receipt_s = time.time() - t
     flush()
     try:
@@ -565,8 +594,13 @@ def _run_job(job, result):
         result["stderr"] = err.getvalue()[-STDOUT_KEEP:]
         if before is not None:
             t = time.time()
-            after = try_value(lambda: _snapshot(full))
-            result["changes"] = try_value(lambda: _diff(before, after)) if after else None
+            # Measure afterwards exactly what was measured before, whatever the body count is now.
+            measured = {k for k, f in before["docs"].items() if "geometry" in f}
+            after = try_value(lambda: _snapshot(bool(measured), only=measured))
+            notes = {}
+            result["changes"] = try_value(lambda: _diff(before, after, notes)) if after else None
+            if full:
+                result["receipt_geometry"] = try_value(lambda: _geometry_summary(before, after, notes))
             result["receipt_ms"] = round((receipt_s + time.time() - t) * 1000, 1)
     if job.get("read_only") and result.get("changes"):
         raise ReadOnlyViolation("This job was sent with --read-only but changed: %s. Nothing was undone."
@@ -728,7 +762,7 @@ class _Watcher(threading.Thread):
                     os.makedirs(AGENT_DIR, exist_ok=True)     # survives the folder being deleted
                     _write_json(BEAT, {"t": now, "pid": os.getpid(), "agent": VERSION,
                                        "sha": SELF_SHA, "file": __file__,
-                                       "features": ["doc", "queue", "receipt", "cancel", "full-receipt"]})
+                                       "features": ["doc", "queue", "receipt", "cancel", "full-receipt", "receipt-limit"]})
                     last_beat = now
                 if os.path.isfile(RUNNING):
                     continue

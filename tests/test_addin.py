@@ -211,6 +211,72 @@ class GeometryReceipt(unittest.TestCase):
         self.assertEqual(self.fa._geometry_diff(before, turn)["parts_moved"], ["P:1: moved [0, 0, 0] mm, turned"])
 
 
+class Counted(list):
+    @property
+    def count(self):
+        return len(self)
+
+
+class ReceiptLimit(unittest.TestCase):
+    """The full receipt is the default from 1.5.0, so a design over the limit must stay cheap, and
+    a document is measured after the job exactly when it was measured before."""
+
+    def setUp(self):
+        self.fa = load_addin(tempfile.mkdtemp(prefix="fa_test_"))
+        self.fa.adsk.fusion.Design = types.SimpleNamespace(cast=lambda x: x)
+        self.measured = []
+        self.fa._geometry = lambda d: self.measured.append(d.tag) or {"bodies": {"C/B": [1.0, 1.0, [0, 0, 0], [6, 12]]},
+                                                                      "placements": {}}
+        self.small, self.big = self.doc("small", 5), self.doc("big", 50)
+        docs = [self.small, self.big]
+        self.fa._app = types.SimpleNamespace(activeDocument=self.small,
+                                             documents=types.SimpleNamespace(count=2, item=lambda i: docs[i]))
+        self.fa._target = self.big
+
+    def doc(self, key, bodies):
+        comp = types.SimpleNamespace(bRepBodies=Counted([object()] * bodies))
+        design = types.SimpleNamespace(tag=key, allComponents=Counted([comp]), designType=0,
+                                       rootComponent=types.SimpleNamespace(allOccurrences=Counted()))
+        return types.SimpleNamespace(creationId=key, name=key.title(), isModified=False,
+                                     products=types.SimpleNamespace(itemByProductType=lambda t: design))
+
+    def test_a_design_over_the_limit_is_counted_not_measured(self):
+        s = self.fa._snapshot(True, 10)
+        self.assertIn("geometry", s["docs"]["small"])
+        self.assertEqual(s["docs"]["big"]["geometry_skipped"], 50)
+        self.assertNotIn("geometry", s["docs"]["big"])
+        self.assertEqual(self.measured, ["small"])
+
+    def test_no_limit_measures_both(self):
+        self.fa._snapshot(True)
+        self.assertEqual(sorted(self.measured), ["big", "small"])
+
+    def test_after_the_job_only_what_was_measured_before(self):
+        s = self.fa._snapshot(True, only={"small"})
+        self.assertEqual(self.measured, ["small"])
+        self.assertNotIn("geometry", s["docs"]["big"])
+        self.assertNotIn("geometry_skipped", s["docs"]["big"])
+
+    def test_skipped_before_is_not_a_change_after(self):
+        before, after = self.fa._snapshot(True, 10), self.fa._snapshot(True, only={"small"})
+        notes = {}
+        self.assertEqual(self.fa._diff(before, after, notes), {})
+        self.assertEqual(self.fa._geometry_summary(before, after, notes),
+                         {"compared": ["Small"], "skipped": {"Big": 50}, "not_measured": []})
+
+    def test_unmeasured_is_a_note_not_a_change(self):
+        # Before 1.5.0 this was a change, so a --read-only job failed on a design it could not measure.
+        g = {"bodies": {}, "placements": {}}
+        snap = lambda geo: {"open": {"k": "A"}, "active": ["k", "A"],
+                            "docs": {"k": {"name": "A", "isModified": False, "geometry": geo}}}
+        notes = {}
+        self.assertEqual(self.fa._diff(snap(None), snap(g), notes), {})
+        self.assertEqual(notes, {"not_measured": ["A (before the job)"]})
+
+    def tearDown(self):
+        self.fa._target = None
+
+
 class Json(unittest.TestCase):
     def test_tuple_keys_survive(self):
         fa = load_addin(tempfile.mkdtemp(prefix="fa_test_"))

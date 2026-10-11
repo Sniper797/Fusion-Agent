@@ -174,5 +174,37 @@ class Helpers(unittest.TestCase):
         self.assertEqual(run_job.describe({"a": [1, 2], "b": 3}), {"a": "list of 2", "b": "int"})
 
 
+class Receipt(unittest.TestCase):
+    def test_full_with_a_limit_is_the_default_from_1_5_0(self):
+        limit = run_job.FULL_RECEIPT_MAX_BODIES
+        self.assertEqual(run_job.receipt_fields(False, False, False, "1.5.0"),
+                         {"receipt": "full", "receipt_max_bodies": limit})
+        self.assertEqual(run_job.receipt_fields(False, False, False, "1.4.0"), {})     # older add-in: counts
+        self.assertEqual(run_job.receipt_fields(False, True, False, "1.5.0"), {})      # --light-receipt
+        self.assertEqual(run_job.receipt_fields(False, False, True, "1.5.0"), {"receipt": "full"})   # no limit
+        self.assertEqual(run_job.receipt_fields(True, False, False, "1.5.0"), {"receipt": False})
+
+    def printed(self, *a):
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            run_job.print_changes(*a)
+        return buf.getvalue()
+
+    def test_none_seen_says_what_was_compared(self):
+        self.assertIn("centre of mass", self.printed({}, {"compared": ["ARIES"], "skipped": {}, "not_measured": []}))
+        self.assertNotIn("centre of mass", self.printed({}, None))
+        self.assertNotIn("centre of mass", self.printed({}, {"compared": [], "skipped": {"Big": 2400}}))
+
+    def test_skipped_and_unmeasured_are_said(self):
+        text = self.printed({}, {"compared": [], "skipped": {"Big v2": 2400}, "not_measured": ["A (before the job)"]})
+        self.assertIn("geometry not compared in Big v2: 2400 bodies, over the 2000-body limit", text)
+        self.assertIn("the geometry of A (before the job) could not be measured", text)
+
+    def test_with_one_skipped_the_line_names_what_was_compared(self):
+        text = self.printed({}, {"compared": ["Untitled"], "skipped": {"Big v2": 2400}, "not_measured": []})
+        self.assertIn("every part's placement in Untitled)", text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,8 @@ frozen Fusion before are refused (exit 5); --allow RULE or --no-preflight overri
 
 With add-in 1.2.0+ jobs wait in line instead of failing as busy, and every result
 lists what changed in the active and the pinned document (--no-receipt skips it).
+With add-in 1.5.0+ that receipt compares every body's shape and every part's placement
+too, in designs up to 2000 bodies; --light-receipt counts only, --full-receipt has no limit.
 
 Exit code: 0 done, 1 the script raised (traceback printed), 2 agent not running
 or bad input (including a --doc that matches no open document), 3 agent busy
@@ -42,11 +44,13 @@ import sys
 import time
 import uuid
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 NEEDS_FOR_DOC = (1, 1, 0)
 NEEDS_FOR_QUEUE = (1, 2, 0)
 NEEDS_FOR_CANCEL = (1, 3, 0)
 NEEDS_FOR_FULL_RECEIPT = (1, 4, 0)
+NEEDS_FOR_RECEIPT_LIMIT = (1, 5, 0)    # full receipt by default, with a body limit the add-in honours
+FULL_RECEIPT_MAX_BODIES = 2000         # measured: 0.4 s per job at 633 bodies; more is counted, not measured
 KEEP_SECONDS = 2 * 24 * 3600        # inline scripts and saved results older than this are swept
 
 # ------------------------------------------------------------- pre-flight check
@@ -628,14 +632,38 @@ def wait_for(d, job, timeout, pid, quiet=False):
     return last, False
 
 
-def print_changes(changes, full=False):
+def receipt_fields(no_receipt, light, full, installed):
+    """What the job asks the add-in to check. Default with add-in 1.5.0+: counts and geometry, the
+    geometry skipped in a design over FULL_RECEIPT_MAX_BODIES bodies. Older add-ins: counts."""
+    if no_receipt:
+        return {"receipt": False}
+    if full:
+        return {"receipt": "full"}
+    if light or version_tuple(installed) < NEEDS_FOR_RECEIPT_LIMIT:
+        return {}
+    return {"receipt": "full", "receipt_max_bodies": FULL_RECEIPT_MAX_BODIES}
+
+
+def print_changes(changes, geometry=None):
+    """geometry: the add-in's receipt_geometry ({"compared", "skipped", "not_measured"}); None: counts only."""
     if changes is None:
         return
+    geometry = geometry or {}
+    compared = geometry.get("compared")
     if not changes:
         print("changes: none seen (open documents, modified flag, timeline, components, bodies, parameters%s)"
-              % (", and every body's volume, area, faces, edges and centre of mass, every part's placement"
-                 if full else ""))
-        return
+              % (", and every body's volume, area, faces, edges and centre of mass, every part's placement%s"
+                 % (" in " + ", ".join(compared) if geometry.get("skipped") else "") if compared else ""))
+    else:
+        print_change_list(changes)
+    for name, n in (geometry.get("skipped") or {}).items():
+        print("note: geometry not compared in %s: %s bodies, over the %d-body limit (--full-receipt compares it)"
+              % (name, n, FULL_RECEIPT_MAX_BODIES))
+    for what in geometry.get("not_measured") or []:
+        print("note: the geometry of %s could not be measured; only the counts were compared" % what)
+
+
+def print_change_list(changes):
     print("--- changes ---")
     for key in ("opened", "closed"):
         if changes.get(key):
@@ -769,10 +797,14 @@ def main():
                         "the active one; default: the FUSION_AGENT_DOC environment variable")
     p.add_argument("--read-only", action="store_true",
                    help="fail (exit 6) when the job changes anything the receipt can see; nothing is undone")
-    p.add_argument("--no-receipt", action="store_true", help="skip the before/after check of the documents")
-    p.add_argument("--full-receipt", action="store_true",
-                   help="also compare every body's volume, area, faces, edges and centre of mass, and every part's "
-                        "placement (about 0.4 s per job on a 633-body assembly)")
+    receipt = p.add_mutually_exclusive_group()
+    receipt.add_argument("--no-receipt", action="store_true", help="skip the before/after check of the documents")
+    receipt.add_argument("--light-receipt", action="store_true",
+                         help="count only; skip the default comparison of every body's volume, area, faces, edges "
+                              "and centre of mass and every part's placement (0.4 s per job at 633 bodies)")
+    receipt.add_argument("--full-receipt", action="store_true",
+                         help="compare the geometry even in a design over the %d-body limit"
+                              % FULL_RECEIPT_MAX_BODIES)
     p.add_argument("--timeout", type=float, default=120, help="seconds to wait, in line and running (default 120)")
     p.add_argument("--cancel-on-timeout", action="store_true",
                    help="when --timeout runs out while the job runs, stop it at its next flush() (an edit may be left half done)")
@@ -900,10 +932,7 @@ def main():
             job["doc"] = a.doc
         if a.read_only:
             job["read_only"] = True
-        if a.no_receipt:
-            job["receipt"] = False
-        elif a.full_receipt:
-            job["receipt"] = "full"
+        job.update(receipt_fields(a.no_receipt, a.light_receipt, a.full_receipt, installed))
 
     if queued:
         job["expires"] = time.time() + a.timeout + 5          # dropped unrun if we have stopped waiting
@@ -999,7 +1028,10 @@ def main():
     if cut_any:
         print("--- full result: %s ---" % full)
     if last.get("action") != "ping" and last.get("status") != "running":
-        print_changes(last.get("changes"), full=bool(a.full_receipt))
+        geometry = last.get("receipt_geometry")
+        if geometry is None and a.full_receipt:
+            geometry = {"compared": ["all"]}     # add-in 1.4.0: --full-receipt measured every document it checked
+        print_changes(last.get("changes"), geometry)
     if last.get("status") == "error":
         print("--- error ---")
         print(last.get("traceback", "").rstrip())
