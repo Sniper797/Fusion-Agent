@@ -15,6 +15,9 @@ and the area inside the outline against the face's area.
 args:
     folder         default <agent folder>/laser/<document>
     only           list of component or body names to export (default: every visible solid)
+    exclude        list of name parts to leave out, e.g. ["REF", "VEX"] (any case)
+    sheet_mm       {"name part": thickness} for parts cut from a sheet thicker or thinner than the
+                   model, e.g. {"Base": 6}: the outline stays, the sheet grouping uses this
     bed            [width, height] of the laser bed in mm (default [1300, 900])
     gap            mm between parts on a sheet (default 5)
     max_thickness  thicker parts are skipped, in mm (default 20)
@@ -34,6 +37,9 @@ bed_w, bed_h = (float(x) for x in args.get("bed", [1300, 900]))
 gap = float(args.get("gap", 5))
 max_t = float(args.get("max_thickness", 20))
 only = set(args.get("only") or [])
+exclude = [x.lower() for x in args.get("exclude") or []]
+sheet_mm = {k.lower(): float(v) for k, v in (args.get("sheet_mm") or {}).items()}
+PRISM_TOL = 0.002          # volume may differ from outline area x thickness by 0.2 %, no more
 
 
 # ------------------------------------------------------------------ the parts
@@ -65,6 +71,10 @@ def flat_part(body):
     t_mm = t_cm * 10
     if t_mm > max_t:
         return None, "%.2f mm thick, over max_thickness %.0f mm" % (t_mm, max_t)
+    ratio = try_value(lambda: body.volume / (cap.area * t_cm))
+    if ratio is not None and abs(ratio - 1) > PRISM_TOL:     # a pocket, a step or a chamfer
+        return None, ("not cut straight through: its volume is %.2f %% of outline x thickness "
+                      "(a pocket, step or chamfer)" % (ratio * 100))
     return (cap, n, t_mm), None
 
 
@@ -250,7 +260,10 @@ def design_bodies():
             continue
         if only and not ({owner.split(":")[0], owner, b.name} & only):
             continue
-        keep.append(("%s - %s" % (owner, b.name), b))
+        name = "%s - %s" % (owner, b.name)
+        if any(x in name.lower() for x in exclude):
+            continue
+        keep.append((name, b))
     return keep
 
 
@@ -280,7 +293,9 @@ for name, body in bodies:
     dxf_len = sum(length_of(e) for e in ents)
     area_model, area_dxf = cap.area * 100.0, loop_area(cap, n)
     vol_check = try_value(lambda: body.volume * 1000.0 / (cap.area * 100.0 * t_mm))
+    sheet_t = next((v for k, v in sheet_mm.items() if k in name.lower()), round(t_mm, 3))
     parts.append({"body": name, "file": os.path.basename(path), "thickness_mm": round(t_mm, 3),
+                  "sheet_mm": sheet_t,
                   "size_mm": [round(x1 - x0, 2), round(y1 - y0, 2)], "holes": cap.loops.count - 1,
                   "entities": read_back(path),
                   "cut_length_mm": round(dxf_len, 2),
@@ -293,8 +308,8 @@ for name, body in bodies:
 
 # Sheets: one set per thickness, parts in rows, turned 90 degrees when that is what fits.
 sheets = []
-for t in sorted({p["thickness_mm"] for p in parts}):
-    group = sorted((p for p in parts if p["thickness_mm"] == t), key=lambda p: -max(p["_w"], p["_h"]))
+for t in sorted({p["sheet_mm"] for p in parts}):          # the sheet it is cut from, not the model
+    group = sorted((p for p in parts if p["sheet_mm"] == t), key=lambda p: -max(p["_w"], p["_h"]))
     pages, x, y, row_h = [[]], gap, gap, 0.0
     for p in group:
         w, h, turn = p["_w"], p["_h"], False

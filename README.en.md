@@ -164,11 +164,15 @@ python run_job.py examples/check_clearance.py
 python run_job.py examples/laser_dxf.py
 python run_job.py examples/laser_dxf.py --args "{\"bed\": [600, 400]}"
 python run_job.py examples/laser_dxf.py --args "{\"demo\": true}"
+python run_job.py examples/laser_dxf.py --doc "ARIES" --args "{\"exclude\": [\"REF\", \"VEX\"], \"sheet_mm\": {\"Base\": 6}}"
 ```
 
-- **What counts as a part:** a solid with two parallel flat faces and every other face square to them. Parts thicker than 20 mm (`max_thickness`) are skipped, with the reason.
+- **What counts as a part:** a solid with two parallel flat faces and every other face square to them. Parts thicker than 20 mm (`max_thickness`) are skipped, with the reason. So are parts with a pocket, step or chamfer: their volume differs from outline area x thickness by more than 0.2%.
+- **Shape alone cannot tell a laser part:** an aluminium VEX plate or a bearing model is as much a prism as an acrylic panel. Pick with `only`, or leave out with `exclude` (part of the name, e.g. `["REF", "VEX"]`).
+- **`sheet_mm`:** when the sheet differs from the model's thickness, e.g. `{"Base": 6}`. The outline stays; the part goes on the 6 mm sheet.
 - **What it writes:** a DXF in mm for each part, from its larger flat face: real lines, arcs and circles, other curves as short lines. Then cutting sheets the size of the laser bed (`bed`, 1300 x 900 by default) per thickness, parts in rows 5 mm apart, turned 90 degrees when that is what fits.
 - **What it checks:** the cut length in the file against the face's edge lengths, the area inside the outline against the face's area, and it reads each file back. On the demo shapes the largest disagreement was 0.0092%; on a plate inside a component turned 30 degrees and moved, 0.0017%.
+- **On a real assembly** (ARIES, 633 bodies, 1.3 s, read-only): it found 13 prisms, VEX plates and bearing models among them. With `exclude` and `sheet_mm`, the three acrylic panels remained, on two sheets, 2.7 mm and 6 mm, with a worst disagreement of 0.0017%.
 - **`demo`:** builds three shapes in memory, so you can try it without any design.
 - **Not done yet:** kerf compensation (cut a coupon on your machine and offset in the laser software), and nesting that saves material: the rows are a check that parts fit the bed more than a layout.
 
