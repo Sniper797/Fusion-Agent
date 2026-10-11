@@ -140,7 +140,7 @@ class OwnExamples(unittest.TestCase):
         # screenshot.py captures the active window and demo_scene.py works in the new, active
         # document it makes, so only those two may use the active-document names.
         for path in glob.glob(os.path.join(ROOT, "examples", "*.py")):
-            if os.path.basename(path) in ("screenshot.py", "demo_scene.py"):
+            if os.path.basename(path) in ("screenshot.py", "demo_scene.py", "selection.py"):
                 continue
             with open(path, encoding="utf-8-sig") as f:
                 _, warnings = run_job.preflight(f.read(), path, pinned=True)

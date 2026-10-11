@@ -11,6 +11,8 @@ running it inside Fusion through the FusionAgent add-in:
     python run_job.py -c "print(doc.name)"            # code without a file
     python run_job.py path/to/script.py --read-only   # exit 6 if it changed anything
     python run_job.py doctor                          # first thing to run when something looks wrong
+    python run_job.py api offset wire                 # the installed Fusion API, offline: signature + doc
+    python run_job.py cancel JOB_ID                   # the id is on the line starting with "job"
 
 The script runs on Fusion's main thread. Ready-made names: `app`, `ui`, `adsk`,
 `args` (dict), `doc` (the pinned or active document), `out` (dict returned to you), `flush()` (write progress now),
@@ -18,7 +20,7 @@ The script runs on Fusion's main thread. Ready-made names: `app`, `ui`, `adsk`,
 `point_mm(x, y, z)`, `try_value(fn, default)`, `to_component_space(temp_body, occ)`,
 `add_tool_and_combine(comp, body, tool, "cut" | "join" | "intersect", name)`,
 `require_timeline_at_end()`, `group_timeline(start, name)`,
-`save_viewport(path, w, h, fit)`, `safe_name(text)`. `print()` output comes back too.
+`save_viewport(path, w, h, fit)`, `safe_name(text)`, `check_cancel()`. `print()` output comes back too.
 Import standard modules (`os`, `math`, ...) yourself. Working examples are in `examples/`.
 
 ## Rules
@@ -42,3 +44,7 @@ Import standard modules (`os`, `math`, ...) yourself. Working examples are in `e
 17. Read the receipt (`--- changes ---`) after every job. Send jobs that should only read with `--read-only`: exit 6 means something changed, and nothing was undone. The receipt counts documents, components, bodies, timeline and parameters; it does not compare geometry, so a moved part or a feature dimension may show only as isModified.
 18. `journal.jsonl` in the agent folder has one line per finished job from every session: read it before assuming who changed a document.
 19. Laser parts: `examples/laser_dxf.py` writes a DXF per flat part plus cutting sheets per thickness, and checks each file against the model (`cut_length_error_pct`, `area_error_pct`, measured at 0.00-0.01 %). `kerf_mm` bakes the kerf in (outlines out, holes in, by half; laser offset 0) and writes a 20 mm coupon: real kerf = 20 + kerf_mm - reading; read `kerf_offset_check_mm` (median and min must equal the target). No real nesting; say so when handing the files over. Geometry cannot tell an acrylic panel from a VEX plate or a bearing model: on ARIES 13 bodies passed, 3 were laser parts. Ask which parts are cut, then pass `only` or `exclude`, and `sheet_mm` when the model is thinner or thicker than the sheet (ARIES base: model 2.4 mm, cut from 6 mm).
+20. Look the API up with `python run_job.py api WORDS` before guessing a method or its arguments: it reads the Fusion actually installed, offline. Example: `createWireFromCurves` takes a Python list, not an ObjectCollection.
+21. STL: `examples/export_stl.py` moves bodies that Fusion wrote in their component's coordinates into the assembly and reports `written_in` and `box_error_mm`; use `frame: component` only when asked.
+22. When the user says "this face" or "the selected part", run `examples/selection.py`, then resolve the tokens with `design().findEntityByToken(token)` in the editing job and stop unless it returns exactly one entity (none: deleted; two: split by a later feature). The selection is the active document's.
+23. Long jobs: call `flush()` after each step. It writes progress and is where a cancelled job stops (exit 7, partial `out` kept). In an edit, call `group_timeline` in a `finally:` (as `snap_fit.py` does), so an edit stopped halfway is still one group to delete. Never wrap the whole script in a bare `except:`, which would swallow the cancel. A timeout stops a running job only with `--cancel-on-timeout`; exit 4 means it may still be running.

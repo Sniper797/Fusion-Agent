@@ -200,13 +200,17 @@ else:
         steps.append(label)
         flush()
 
-    apply(mount_occ, args.get("mount_body"), tip_off, "cut", "Snap pin: tip off")
-    apply(mount_occ, args.get("mount_body"), tip_new, "join", "Snap pin: barb")
-    apply(mount_occ, args.get("mount_body"), slot, "cut", "Snap pin: slot")
-    if fill is not None:
-        apply(part_occ, args.get("part_body"), fill, "join", "Snap part: fill old bore")
-    apply(part_occ, args.get("part_body"), bore, "cut", "Snap part: bore + catch groove")
-    group = group_timeline(start, args.get("group_name", "Snap-fit")) if parametric else None
+    try:
+        apply(mount_occ, args.get("mount_body"), tip_off, "cut", "Snap pin: tip off")
+        apply(mount_occ, args.get("mount_body"), tip_new, "join", "Snap pin: barb")
+        apply(mount_occ, args.get("mount_body"), slot, "cut", "Snap pin: slot")
+        if fill is not None:
+            apply(part_occ, args.get("part_body"), fill, "join", "Snap part: fill old bore")
+        apply(part_occ, args.get("part_body"), bore, "cut", "Snap part: bore + catch groove")
+    finally:                                 # cancelled or failed halfway: still one group to delete
+        group = group_timeline(start, args.get("group_name", "Snap-fit")) if parametric else None
+        if len(steps) < (5 if fill is not None else 4):
+            out["incomplete"] = "stopped after: %s" % (steps or "nothing")
 
     # ------------------------------------------------------------ verify
     mount_proxy = one_solid_body(mount_occ, args.get("mount_body"))

@@ -21,6 +21,8 @@ args:
     bed            [width, height] of the laser bed in mm (default [1300, 900])
     gap            mm between parts on a sheet (default 5)
     max_thickness  thicker parts are skipped, in mm (default 20)
+    up             [x, y, z]: the model's up, when it is not your Fusion preference's (Y or Z up).
+                   Standing panels are drawn with this up pointing up.
     kerf_mm        the laser's cut width, baked into the files (default 0: no offset). Outlines
                    move out and holes in by half of it, so parts come out at model size; set the
                    laser's own offset to 0. A 20 mm coupon file comes with it: cut it first,
@@ -55,8 +57,10 @@ def face_normal(face):
     return n
 
 
-def flat_part(body):
-    """(cap face, its outward normal, thickness in mm) or (None, reason)."""
+def flat_part(body, centre=None):
+    """(cap face, its outward normal, thickness in mm) or (None, reason). With `centre` (the
+    assembly's middle), the cap is the big face looking away from it: the part as seen from
+    outside, so the same panel is never drawn mirrored from one run to the next."""
     planes = [f for f in body.faces if adsk.core.Plane.cast(f.geometry)]
     if len(planes) < 2:
         return None, "fewer than two flat faces"
@@ -66,6 +70,12 @@ def flat_part(body):
     others = [f for f in planes if f != cap and face_normal(f).dotProduct(n) < -0.99999]
     if not others:
         return None, "no flat face opposite the largest one"
+    twin = max(others, key=lambda f: f.area)
+    if centre is not None and abs(twin.area - cap.area) <= 1e-6 * cap.area \
+            and centre.vectorTo(o).dotProduct(n) < 0:          # cap faces the inside: draw the other one
+        cap, others = twin, [f for f in planes if f != twin and face_normal(f).dotProduct(face_normal(twin)) < -0.99999]
+        n = face_normal(cap)
+        o = cap.pointOnFace
     depth = [abs(o.vectorTo(v.geometry).dotProduct(n)) for v in body.vertices] or [0]
     t_cm = max(depth)
     for f in body.faces:
@@ -83,13 +93,38 @@ def flat_part(body):
     return (cap, n, t_mm), None
 
 
+def model_up():
+    """The up of the drawings: args["up"], else the Fusion preference (Preferences > General >
+    Default modeling orientation). The preference is the user's, not the open design's: a design
+    made Y-up by someone else needs `up`."""
+    if args.get("up"):
+        return V(*[float(x) for x in args["up"]])
+    o = try_value(lambda: app.preferences.generalPreferences.defaultModelingOrientation)
+    if o == try_value(lambda: adsk.core.DefaultModelingOrientations.YUpModelingOrientation):
+        return V(0, 1, 0)
+    return V(0, 0, 1)
+
+
+UP = model_up()
+
+
 def frame(face, n):
     """Origin and two in-plane axes, so (u, v, n) is right-handed: looking at the face from
-    outside, the drawing is not mirrored."""
+    outside, the drawing is not mirrored. For a standing or sloping face, v is the model's up
+    as it runs along the face, so the drawing stands the way the part does; for a lying face,
+    Fusion's own in-plane direction."""
     plane = adsk.core.Plane.cast(face.geometry)
-    u = plane.uDirection.copy()
+    up = UP.copy()
+    k = up.dotProduct(n)
+    v = V(up.x - k * n.x, up.y - k * n.y, up.z - k * n.z)       # up, flattened onto the face
+    if v.length > 0.1:
+        v.normalize()
+        u = v.crossProduct(n)                                      # u x v = n
+    else:
+        u = plane.uDirection.copy()
+        u.normalize()
+        v = n.crossProduct(u)
     u.normalize()
-    v = n.crossProduct(u)
     v.normalize()
     return plane.origin, u, v
 
@@ -363,6 +398,11 @@ def design_bodies():
 
 demo = bool(args.get("demo"))
 bodies = demo_bodies() if demo else design_bodies()
+centre = None
+if not demo and bodies:                            # the parts' middle: they are drawn as seen from outside
+    _lo = [min(getattr(b.boundingBox.minPoint, a) for _, b in bodies) for a in "xyz"]   # bodies only:
+    _hi = [max(getattr(b.boundingBox.maxPoint, a) for _, b in bodies) for a in "xyz"]   # no sketches or canvases
+    centre = adsk.core.Point3D.create(*[(l + h) / 2 for l, h in zip(_lo, _hi)])
 label = "demo" if demo else doc.name
 folder = args.get("folder") or os.path.join(agent_dir, "laser", safe_name(label))
 os.makedirs(folder, exist_ok=True)
@@ -372,7 +412,7 @@ out["folder"] = folder
 out["parts"] = parts
 out["skipped"] = skipped
 for name, body in bodies:
-    found, why = try_value(lambda: flat_part(body), (None, "could not be measured"))
+    found, why = try_value(lambda: flat_part(body, centre), (None, "could not be measured"))
     if not found:
         skipped.append({"body": name, "why": why})
         continue

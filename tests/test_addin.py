@@ -77,6 +77,16 @@ class AddinFiles(unittest.TestCase):
         with open(os.path.join(self.fa.RESULTS, "old.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["error"]["type"], "JobExpired")
 
+    def test_cancelled_queued_job_is_dropped_unrun(self):
+        gone = self.queue("00000000000000000001-c.json", id="c", expires=time.time() + 60)
+        os.makedirs(self.fa.CANCEL, exist_ok=True)
+        open(os.path.join(self.fa.CANCEL, "c"), "w").close()
+        self.assertIsNone(self.fa._next_job(time.time()))
+        self.assertFalse(os.path.exists(gone))
+        self.assertFalse(os.path.exists(os.path.join(self.fa.CANCEL, "c")))     # cleaned up
+        with open(os.path.join(self.fa.RESULTS, "c.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["error"]["type"], "JobCancelled")
+
     def test_journal_appends_and_rotates(self):
         self.fa.JOURNAL_MAX = 200
         for i in range(5):

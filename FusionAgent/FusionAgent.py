@@ -40,7 +40,7 @@ import threading
 import time
 import traceback
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 EVENT_ID = "FusionAgentJobEvent"
 POLL_SEC = 0.05         # how often the watcher looks for a job: a stat call, nothing more
 BEAT_SEC = 1.0          # how often it rewrites alive.json
@@ -64,6 +64,7 @@ BEAT = os.path.join(AGENT_DIR, "alive.json")
 QUEUE = os.path.join(AGENT_DIR, "queue")
 RESULTS = os.path.join(AGENT_DIR, "results")
 JOURNAL = os.path.join(AGENT_DIR, "journal.jsonl")
+CANCEL = os.path.join(AGENT_DIR, "cancel")    # cancel/<id>: stop that job at its next flush() or check_cancel()
 
 
 def _file_sha(path):
@@ -294,6 +295,11 @@ class JobInputError(LookupError):
     """A job asked for something that is not there; reported without a traceback."""
 
 
+class JobCancelled(BaseException):
+    """Raised in a job at flush() or check_cancel() once cancel/<id> exists. BaseException, so
+    try_value() and `except Exception` in scripts cannot swallow it."""
+
+
 class ReadOnlyViolation(RuntimeError):
     """A job sent with --read-only changed something. Detected after the fact, never undone."""
 
@@ -430,6 +436,13 @@ def _run_job(job, result):
     result["script"] = path
     result["ran_on"] = _doc_info(_target or _app.activeDocument)
 
+    cancel_file = os.path.join(CANCEL, str(job.get("id")))
+
+    def check_cancel():
+        """Stop here if this job was cancelled (run_job.py cancel, Ctrl+C, or its client timed out)."""
+        if os.path.exists(cancel_file):
+            raise JobCancelled("cancelled at the script's request point; the result so far is kept")
+
     def flush():
         """Write the result so far, so a long or stuck job still shows progress."""
         text = buf.getvalue()
@@ -437,13 +450,14 @@ def _run_job(job, result):
         result["stdout_truncated"] = len(text) > STDOUT_KEEP
         result["stderr"] = err.getvalue()[-STDOUT_KEEP:]
         _write_json(RESULT, result)
+        check_cancel()
 
     scope = dict(HELPERS)
     scope.update({"__name__": "__fusion_agent_job__", "__file__": path,
                   "adsk": adsk, "app": _app, "ui": _ui,
                   "doc": _target or _app.activeDocument,
                   "args": job.get("args") or {}, "out": out, "flush": flush,
-                  "agent_dir": AGENT_DIR})
+                  "agent_dir": AGENT_DIR, "check_cancel": check_cancel})
     t = time.time()
     before = try_value(_snapshot) if job.get("receipt", True) else None
     receipt_s = time.time() - t
@@ -510,7 +524,7 @@ def _describe_error(exc, script):
 
 def _record_error(result, exc):
     result["status"] = "error"
-    if isinstance(exc, (JobInputError, ReadOnlyViolation)):   # not a bug in the code: no traceback
+    if isinstance(exc, (JobInputError, ReadOnlyViolation, JobCancelled)):   # not a bug in the code: no traceback
         result["traceback"] = "%s: %s" % (type(exc).__name__, exc)
         result["error"] = {"type": type(exc).__name__, "message": str(exc)}
         return
@@ -518,6 +532,13 @@ def _record_error(result, exc):
         result["traceback"], result["error"] = _describe_error(exc, result.get("script"))
     except Exception:                        # describing must never hide the real error
         result["traceback"] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+def _forget_cancel(job_id):
+    try:
+        os.remove(os.path.join(CANCEL, str(job_id)))
+    except OSError:
+        pass
 
 
 def _journal(job, result, started):
@@ -570,6 +591,7 @@ def _execute():
                                      "error": {"type": "ResultNotWritten", "message": repr(e)}})
             except Exception:
                 pass
+        _forget_cancel(result.get("id"))
         if result.get("id"):                 # its own file: the next job overwrites result.json
             try:
                 os.makedirs(RESULTS, exist_ok=True)
@@ -614,7 +636,7 @@ class _Watcher(threading.Thread):
                     os.makedirs(AGENT_DIR, exist_ok=True)     # survives the folder being deleted
                     _write_json(BEAT, {"t": now, "pid": os.getpid(), "agent": VERSION,
                                        "sha": SELF_SHA, "file": __file__,
-                                       "features": ["doc", "queue", "receipt"]})
+                                       "features": ["doc", "queue", "receipt", "cancel"]})
                     last_beat = now
                 if os.path.isfile(RUNNING):
                     continue
@@ -642,14 +664,17 @@ def _next_job(now):
                 job = json.load(f)
         except (OSError, ValueError):
             continue
-        if job.get("expires") and job["expires"] < now:
+        cancelled = os.path.exists(os.path.join(CANCEL, str(job.get("id"))))
+        if cancelled or (job.get("expires") and job["expires"] < now):
+            kind = "JobCancelled" if cancelled else "JobExpired"
+            why = "cancelled before it started" if cancelled else "dropped unrun: its client stopped waiting"
             try:
                 os.remove(path)
                 os.makedirs(RESULTS, exist_ok=True)
                 _write_json(os.path.join(RESULTS, "%s.json" % job.get("id")),
                             {"id": job.get("id"), "status": "error", "agent": VERSION,
-                             "error": {"type": "JobExpired", "message": "dropped unrun: its client stopped waiting"},
-                             "traceback": "JobExpired: dropped unrun, its client stopped waiting"})
+                             "error": {"type": kind, "message": why}, "traceback": "%s: %s" % (kind, why)})
+                _forget_cancel(job.get("id"))
             except OSError:
                 pass
             continue

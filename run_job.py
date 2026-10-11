@@ -20,8 +20,16 @@ lists what changed in the active and the pinned document (--no-receipt skips it)
 
 Exit code: 0 done, 1 the script raised (traceback printed), 2 agent not running
 or bad input (including a --doc that matches no open document), 3 agent busy
-(add-ins older than 1.2.0), 4 timed out, 5 refused by the pre-flight check,
-6 a --read-only job changed something.
+(add-ins older than 1.2.0), 4 timed out or stopped waiting (the job may still run;
+its result lands in results/<id>.json), 5 refused by the pre-flight check, 6 a
+--read-only job changed something, 7 the job really was cancelled: it stopped at a
+flush() or check_cancel(), or left the queue before starting; the result so far is printed.
+
+    python run_job.py cancel ID                   queued: taken out; running: stops at its next flush()
+
+A timeout cancels a job that has not started yet (a window holding Fusion, say), so it
+never runs later with nobody waiting. A running job is stopped on timeout only with
+--cancel-on-timeout: an edit stopped halfway leaves half a change.
 Standard library only.
 """
 import argparse
@@ -33,9 +41,10 @@ import sys
 import time
 import uuid
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 NEEDS_FOR_DOC = (1, 1, 0)
 NEEDS_FOR_QUEUE = (1, 2, 0)
+NEEDS_FOR_CANCEL = (1, 3, 0)
 KEEP_SECONDS = 2 * 24 * 3600        # inline scripts and saved results older than this are swept
 
 # ------------------------------------------------------------- pre-flight check
@@ -361,6 +370,124 @@ def sweep(folder):
         pass
 
 
+def api_sources():
+    """The Python API files of the newest installed Fusion: adsk/core.py, fusion.py, cam.py..."""
+    import glob
+    if sys.platform == "darwin":
+        pattern = os.path.expanduser("~/Library/Application Support/Autodesk/webdeploy/production/*/"
+                                     "Autodesk Fusion.app/Contents/Api/Python/packages/adsk/fusion.py")
+    else:
+        pattern = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Autodesk", "webdeploy", "production", "*",
+                               "Api", "Python", "packages", "adsk", "fusion.py")
+    found = sorted(glob.glob(pattern), key=os.path.getmtime)
+    if not found:
+        return None, []
+    folder = os.path.dirname(found[-1])
+    return folder, sorted(glob.glob(os.path.join(folder, "*.py")))
+
+
+API_INDEX_FORMAT = 2        # bump when the index's shape changes, so old caches are rebuilt
+
+
+def annotation(node):
+    """Fusion writes its type hints as strings ("Vector3D"); ast.unparse needs Python 3.9+."""
+    if node is None:
+        return ""
+    if isinstance(node, ast.Constant):
+        return str(node.value)
+    return ast.unparse(node).strip("'\"") if hasattr(ast, "unparse") else ""
+
+
+def api_index(folder, files):
+    """Every public class, method and property with its signature and doc, read with ast (nothing
+    is imported). Cached next to the jobs, keyed by the files' sizes and times."""
+    key = [API_INDEX_FORMAT] + [[os.path.basename(f), os.path.getsize(f), int(os.path.getmtime(f))] for f in files]
+    cache = os.path.join(agent_dir(), "api_index.json")
+    old = read_json(cache)
+    if old and old.get("key") == key:
+        return old["entries"]
+    entries = []
+    for path in files:
+        module = "adsk." + os.path.splitext(os.path.basename(path))[0]
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        for cls in tree.body:
+            if not isinstance(cls, ast.ClassDef) or cls.name.startswith("_"):
+                continue
+            entries.append({"name": "%s.%s" % (module, cls.name), "kind": "class",
+                            "doc": ast.get_docstring(cls) or ""})
+            setters = {f.name[5:] for f in cls.body if isinstance(f, ast.FunctionDef) and f.name.startswith("_set_")}
+            for fn in cls.body:
+                if not isinstance(fn, ast.FunctionDef):
+                    continue
+                doc = (ast.get_docstring(fn) or "").strip()
+                ret = annotation(fn.returns)
+                if fn.name.startswith("_get_"):
+                    prop = fn.name[5:]
+                    entries.append({"name": "%s.%s.%s" % (module, cls.name, prop), "kind": "property",
+                                    "sig": "%s: %s%s" % (prop, ret, "" if prop in setters else "  (read-only)"),
+                                    "doc": doc})
+                elif not fn.name.startswith("_"):
+                    args_ = fn.args.args[1:] if fn.args.args and fn.args.args[0].arg == "self" else fn.args.args
+                    defaults = [None] * (len(args_) - len(fn.args.defaults)) + list(fn.args.defaults)
+                    params = []
+                    for a, default in zip(args_, defaults):
+                        text = a.arg + (": " + annotation(a.annotation) if a.annotation else "")
+                        if default is not None:
+                            text += " = " + (repr(default.value) if isinstance(default, ast.Constant) else "...")
+                        params.append(text)
+                    if fn.args.vararg:               # SWIG overloads: def f(self, *args); the doc lists the forms
+                        params.append("*" + fn.args.vararg.arg + "  (overloaded: see the doc)")
+                    # Output arguments: named in the doc ("normal : ...") but not taken by the call; the
+                    # Python call returns them after the stub's return value, as a tuple.
+                    taken = {a.arg for a in args_}
+                    outputs = [m for m in re.findall(r"^\s*(\w+) : ", doc, re.M) if m not in taken] \
+                        if not fn.args.vararg else []
+                    if outputs:
+                        ret = "(%s)" % ", ".join([ret or "result"] + outputs)
+                    entries.append({"name": "%s.%s.%s" % (module, cls.name, fn.name), "kind": "method",
+                                    "sig": "%s(%s)%s" % (fn.name, ", ".join(params), " -> " + ret if ret else ""),
+                                    "doc": doc})
+    try:
+        with open(cache, "w", encoding="utf-8") as f:
+            json.dump({"key": key, "entries": entries}, f)
+    except OSError:
+        pass
+    return entries
+
+
+def api_command(words, limit=12):
+    """Search the installed Fusion API offline: every word must appear in the name, or in the doc."""
+    folder, files = api_sources()
+    if not files:
+        print("No Fusion API files found (looked under webdeploy/production). Is Fusion installed?")
+        return 2
+    entries = api_index(folder, files)
+    if not words:
+        print("usage: python run_job.py api WORD [WORD...]   e.g.  api offset wire   or   api SaveImageFileOptions")
+        return 2
+    low = [w.lower() for w in words]
+
+    def short(e):                            # "BRepBody.volume", not "adsk.fusion.BRepBody.volume"
+        return e["name"].split(".", 2)[2].lower()
+
+    exact = [e for e in entries if short(e).rsplit(".", 1)[-1] == low[-1] and all(w in short(e) for w in low)]
+    seen = {id(e) for e in exact}
+    by_name = [e for e in entries if id(e) not in seen and all(w in short(e) for w in low)]
+    seen |= {id(e) for e in by_name}
+    by_doc = [e for e in entries if id(e) not in seen and all(w in (short(e) + " " + e["doc"]).lower() for w in low)]
+    hits = sorted(exact, key=lambda e: e["name"]) + sorted(by_name, key=lambda e: (len(e["name"]), e["name"])) + by_doc
+    print("Fusion API in %s: %d matches%s" % (folder, len(hits), "" if len(hits) <= limit else ", first %d" % limit))
+    for e in hits[:limit]:
+        owner = e["name"].rsplit(".", 1)[0] if e["kind"] != "class" else e["name"]
+        title = "%s.%s" % (owner, e["sig"]) if e.get("sig") else "class %s" % e["name"]
+        doc = " ".join(e["doc"].split())
+        print("\n" + title)
+        if doc:
+            print("    " + (doc if len(hits) == 1 else doc[:300] + ("..." if len(doc) > 300 else "")))
+    return 0 if hits else 1
+
+
 def addins_dir():
     """Where Fusion looks for add-ins on this computer."""
     if sys.platform == "darwin":
@@ -389,6 +516,53 @@ def file_version(path):
         return m.group(1) if m else None
     except OSError:
         return None
+
+
+def remove_quietly(path):
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def request_cancel(d, job_id, installed=None, announce=False):
+    """Stop a job: still in line, it is taken out and never runs; running, it stops at its next
+    flush() or check_cancel(). Returns 0 when the request is in place."""
+    if installed is None:
+        installed = (read_json(os.path.join(d, "alive.json")) or {}).get("agent")
+    if version_tuple(installed) < NEEDS_FOR_CANCEL:
+        print("The running add-in (%s) cannot cancel jobs; it needs %s."
+              % (installed, ".".join(map(str, NEEDS_FOR_CANCEL))))
+        return 2
+    results = os.path.join(d, "results", job_id + ".json")
+    final = read_json(results)
+    if final and final.get("status") in ("done", "error"):
+        if announce:
+            print("Job %s has already ended (%s); nothing to cancel. Its result: %s"
+                  % (job_id, final.get("status"), os.path.normpath(results)))
+        return 0
+    try:
+        queued = [n for n in os.listdir(queue_dir(d)) if n.endswith("-%s.json" % job_id)]
+    except OSError:
+        queued = []
+    for name in queued:                       # still in line: take it out here, at once
+        if remove_quietly(os.path.join(queue_dir(d), name)):
+            os.makedirs(os.path.dirname(results), exist_ok=True)
+            with open(results, "w", encoding="utf-8") as f:
+                json.dump({"id": job_id, "status": "error", "agent": installed,
+                           "error": {"type": "JobCancelled", "message": "cancelled before it started"},
+                           "traceback": "JobCancelled: cancelled before it started"}, f)
+            if announce:
+                print("Job %s was still in line: taken out, it never ran." % job_id)
+            return 0
+    os.makedirs(os.path.join(d, "cancel"), exist_ok=True)
+    with open(os.path.join(d, "cancel", job_id), "w") as f:
+        f.write(str(time.time()))
+    if announce:
+        print("Asked job %s to stop at its next flush() or check_cancel(). Its result: %s"
+              % (job_id, os.path.normpath(results)))
+    return 0
 
 
 def queue_dir(d):
@@ -568,7 +742,8 @@ def main():
     except Exception:
         pass
     p = argparse.ArgumentParser(description="Run a Python script inside Autodesk Fusion via FusionAgent.")
-    p.add_argument("script", nargs="?", help='a .py file to run inside Fusion, "ping", or "doctor"')
+    p.add_argument("script", nargs="?", help='a .py file to run inside Fusion, or: ping, doctor, api WORD...')
+    p.add_argument("words", nargs="*", help="for api: words to look up in the installed Fusion API")
     p.add_argument("-c", "--code", help='Python code to run instead of a file ("-" reads it from stdin)')
     p.add_argument("-e", "--eval", dest="expr", help='one expression; its value comes back as out["value"]')
     p.add_argument("--args", help="JSON object passed to the script as `args`")
@@ -580,6 +755,8 @@ def main():
                    help="fail (exit 6) when the job changes anything the receipt can see; nothing is undone")
     p.add_argument("--no-receipt", action="store_true", help="skip the before/after check of the documents")
     p.add_argument("--timeout", type=float, default=120, help="seconds to wait, in line and running (default 120)")
+    p.add_argument("--cancel-on-timeout", action="store_true",
+                   help="when --timeout runs out while the job runs, stop it at its next flush() (an edit may be left half done)")
     p.add_argument("--save", help="also write the full result JSON to this file")
     p.add_argument("--print-limit", type=int, default=8000,
                    help="print at most this many characters of out and of printed output (0: no limit)")
@@ -591,6 +768,14 @@ def main():
     if len(sources) != 1:
         p.error("give exactly one of: SCRIPT, ping, doctor, -c CODE, -e EXPRESSION")
 
+    if a.script == "cancel":
+        if len(a.words) != 1:
+            p.error("usage: python run_job.py cancel JOB_ID")
+        return request_cancel(agent_dir(), a.words[0], announce=True)
+    if a.words and a.script != "api":
+        p.error("unexpected extra arguments: %s" % " ".join(a.words))
+    if a.script == "api":                    # offline: reads the installed API files, never contacts Fusion
+        return api_command(a.words)
     d = agent_dir()
     if a.script == "doctor":
         return doctor(d)
@@ -629,6 +814,7 @@ def main():
         return 3
 
     job = {"id": uuid.uuid4().hex, "caller": {"cwd": os.getcwd(), "pid": os.getpid()}}
+    print("job %s" % job["id"], flush=True)          # for: python run_job.py cancel <id>
     if a.script == "ping":
         job["action"] = "ping"
     else:
@@ -703,30 +889,51 @@ def main():
     else:
         submit(d, job, False)
 
-    last, finished = wait_for(d, job, a.timeout, beat.get("pid"))
+    can_cancel = version_tuple(installed) >= NEEDS_FOR_CANCEL
+    res_path = os.path.normpath(os.path.join(d, "results", job["id"] + ".json"))
+    try:
+        last, finished = wait_for(d, job, a.timeout, beat.get("pid"))
+    except KeyboardInterrupt:                # Ctrl+C: out of the queue if it never started, else ask it to stop
+        if job.get("queue_file") and remove_quietly(job["queue_file"]):
+            print("\nTaken out of the queue; it never ran.")
+            return 7
+        if not can_cancel or request_cancel(d, job["id"], installed) != 0:
+            print("\nStopped waiting. The add-in (%s) cannot cancel it: it goes on in Fusion, and its result "
+                  "will land in %s" % (installed, res_path))
+            return 4
+        print("\nAsked the job to stop at its next flush() or check_cancel(); waiting up to 30 s.", flush=True)
+        try:
+            last, finished = wait_for(d, job, 30, beat.get("pid"), quiet=True)
+        except KeyboardInterrupt:
+            finished = False
+        if not finished:
+            print("It has not reached a flush() yet; it stops at the next one. Its result will land in %s" % res_path)
+            return 4
     if not finished:
-        qf = job.get("queue_file")
-        if qf:
-            try:
-                os.remove(qf)
-                print("Gave up after %.0f s in line; the job was taken out of the queue and never ran." % a.timeout)
-                return 4
-            except OSError:
-                pass                         # the add-in took it meanwhile
+        if job.get("queue_file") and remove_quietly(job["queue_file"]):
+            print("Gave up after %.0f s in line; the job was taken out of the queue and never ran." % a.timeout)
+            return 4
+        running = last is not None and last.get("status") == "running"
+        if can_cancel and (not running or a.cancel_on_timeout):
+            # Not started yet (a window holds Fusion): stopping it before it runs is safe. Running: only when
+            # asked, because an edit stopped halfway leaves half a change in the design.
+            if request_cancel(d, job["id"], installed) == 0:
+                print("Asked the job to stop %s." % ("at its next flush()" if running else "before it starts"))
         if last is None:
             print("No result after %.0f s." % a.timeout)
             blocked = blocking_windows(beat.get("pid"))
             print(say_blocked(blocked) if blocked else "Fusion may be busy or showing a dialog.")
             if queued:
-                print("If it still runs, its result will land in %s"
-                      % os.path.normpath(os.path.join(d, "results", job["id"] + ".json")))
+                print("If it still runs, its result will land in %s" % res_path)
             return 4
 
     results = os.path.join(d, "results")
     os.makedirs(results, exist_ok=True)
     sweep(results)
+    sweep(os.path.join(d, "cancel"))
     full = os.path.join(results, job["id"] + ".json")
-    for path in [full] + ([a.save] if a.save else []):
+    # results/<id>.json belongs to the add-in once the job ends; a partial copy must not overwrite it.
+    for path in ([full] if finished else []) + ([a.save] if a.save else []):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(last, f, ensure_ascii=False, indent=2)
 
@@ -776,6 +983,8 @@ def main():
         kind = (last.get("error") or {}).get("type")
         if kind == "JobInputError":
             return 2                         # a wrong --doc is bad input, not a failing script
+        if kind == "JobCancelled":
+            return 7
         if kind == "ReadOnlyViolation":
             return 6
         return 1

@@ -70,12 +70,20 @@ python run_job.py -c "print(design().rootComponent.name)"
 python run_job.py -e "design().timeline.count"
 python run_job.py examples/inspect_design.py --read-only
 python run_job.py doctor
+python run_job.py api offset wire
+python run_job.py cancel <job id>
 ```
 
 - `-c` sends code without a file, and `-e` sends one expression whose value comes back in `out["value"]`.
 - **What it prints:** what the script printed, then `out`.
 - **Long output** is cut at 8,000 characters (`--print-limit`), and the full result is saved to a file whose path is printed.
 - **If the script fails,** it prints the error with your script's own lines only, plus a hint when it matches a known trap.
+- **`api`** searches the Fusion API documentation installed on your computer, without contacting Fusion: the method, its signature and its description. About 3 s the first time to build the index, then under a second.
+- **The job id** is on the line starting with `job`. To stop a job: `cancel` with that id, or Ctrl+C.
+  - **Queued:** it is dropped and never runs.
+  - **Running:** it stops at its next `flush()` or `check_cancel()` and returns what it got to.
+  - **Timeout before it started** (a window holding Fusion, say): it is cancelled, so it never runs later with nobody waiting.
+  - **Timeout while it runs:** it is stopped only with `--cancel-on-timeout`, because an edit stopped halfway leaves half a change.
 - **After every job** it prints what changed in the document; see "Queue and change receipt" below.
 
 **Exit codes:**
@@ -86,9 +94,10 @@ python run_job.py doctor
 | 1 | The script raised an error |
 | 2 | The add-in is not running, or the input is wrong, including a `--doc` name that matches no open document |
 | 3 | The add-in is busy with another job. Only with add-ins older than 1.2.0; newer ones queue the job |
-| 4 | Timed out |
+| 4 | Timed out, or you stopped waiting. The job may still be running; its result lands in `results/<id>.json` |
 | 5 | Refused by the pre-flight check, so it was not sent |
 | 6 | A job sent with `--read-only` changed something. Nothing was undone |
+| 7 | The job really was cancelled: it stopped, or it was taken out of the queue before it started. It prints what it got to |
 
 ## Choose the document: `--doc`
 
@@ -139,8 +148,9 @@ With add-in 1.2.0 or newer:
 | `inspect_design.py` | Components, bodies (volume, size, material), joints and parameters | No |
 | `check_clearance.py` | Interference and smallest gap between every two bodies. Refuses a large assembly until you narrow it with `only` | No |
 | `backup_f3d.py` | An .f3d copy of the open document | No |
-| `export_stl.py` | An STL for every visible body | No |
-| `screenshot.py` | A picture of the view; parts can be hidden for the shot and shown again | No, and it restores the camera |
+| `export_stl.py` | An STL for every visible body **where it sits in the assembly**: Fusion writes a body in its component's coordinates, so it is moved and checked against the body's box | No |
+| `screenshot.py` | Pictures from the directions you choose (`views`: front, top, iso...), on a transparent background if you want (`transparent`); parts can be hidden for the shots | No, and it restores the camera |
+| `selection.py` | What you have selected in Fusion right now, measured, with a token per item for a later job: `design().findEntityByToken(token)`. Check that it returns exactly one entity: none if it was deleted, two if a later feature split it | No |
 | `demo_scene.py` | A **new** document with a mount, a pin and a gear to experiment on | Only creates a new document |
 | `snap_fit.py` | Turns the pin into a snap-fit, and opens a bore with a catch groove in the part | Yes, as one group at the end of the timeline |
 | `laser_dxf.py` | A laser DXF for every flat part, cutting sheets per thickness, and each file checked against the model | No |
@@ -175,6 +185,7 @@ python run_job.py examples/laser_dxf.py --args "{\"kerf_mm\": 0.1}"
 - **What it checks:** the cut length in the file against the face's edge lengths, the area inside the outline against the face's area, and it reads each file back. On the demo shapes the largest disagreement was 0.0092%; on a plate inside a component turned 30 degrees and moved, 0.0017%.
 - **On a real assembly** (ARIES, 633 bodies, 1.3 s, read-only): it found 13 prisms, VEX plates and bearing models among them. With `exclude` and `sheet_mm`, the three acrylic panels remained, on two sheets, 2.7 mm and 6 mm, with a worst disagreement of 0.0017%.
 - **`kerf_mm`:** bakes the cut width into the files, the Center's way: outlines move out and holes in by half of it, with Fusion's own wire offset, and sharp corners stay sharp. Set the laser's offset to 0. A 20 mm square coupon comes with it: cut it first and measure it; real kerf = 20 + `kerf_mm` - your reading. Then it measures the distance from every moved loop to the model's curves: on ARIES with 0.10, the median and the minimum were exactly 0.050 mm.
+- **Orientation:** each part is drawn from its face that looks out of the assembly, so it never comes out mirrored. A standing or sloping panel is drawn upright as in the model, with the modeling up from your Fusion preferences as up. If the model was made the other way, pass `up`, e.g. `[0, 1, 0]`.
 - **`demo`:** builds three shapes in memory, so you can try it without any design.
 - **Not done yet:** nesting that saves material: the rows are a check that parts fit the bed more than a layout.
 
@@ -188,7 +199,8 @@ A script is an ordinary Python file that runs inside Fusion, with these names re
 | `args` | What you sent with `--args` or `--args-file` |
 | `doc` | The document the script works on: the one `--doc` pins, otherwise the active one |
 | `out` | A dictionary that comes back to you as the result |
-| `flush()` | Writes the result now. Call it after each step of a long job |
+| `flush()` | Writes the result now. Call it after each step of a long job; it is also where a cancelled job stops |
+| `check_cancel()` | Stops here if the job was cancelled, without writing anything |
 | `agent_dir` | The add-in's folder, and the default place for output files |
 | `design()` | The open design |
 | `find_occurrence(name)` | A component by its name |
