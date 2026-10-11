@@ -227,6 +227,35 @@ class Bench:
         return {"wall": round(dt, 3), "text": text, "error": err}
 
 
+def protocol_round_trip(script, queued):
+    """Hand a job to the add-in the way run_job.py does and poll every 5 ms for its result."""
+    import uuid
+    d = agent_dir()
+    jid = uuid.uuid4().hex
+    job = {"id": jid, "action": "exec_file", "path": script, "args": {}, "receipt": False}
+    if queued:
+        os.makedirs(os.path.join(d, "queue"), exist_ok=True)
+        path = os.path.join(d, "queue", "%020d-%s.json" % (time.time_ns(), jid))
+        job["expires"] = time.time() + 30
+    else:
+        path = os.path.join(d, "job.json")
+    t = time.perf_counter()
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(job, f)
+    os.replace(path + ".tmp", path)
+    final, live = os.path.join(d, "results", jid + ".json"), os.path.join(d, "result.json")
+    while time.perf_counter() - t < 30:
+        for p in (final, live):
+            try:
+                r = json.load(open(p, encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            if r.get("id") == jid and r.get("status") in ("done", "error"):
+                return round(time.perf_counter() - t, 3)
+        time.sleep(0.005)
+    return None
+
+
 def digest(obj):
     return hashlib.md5(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:10]
 
@@ -236,9 +265,18 @@ def main():
     ap.add_argument("--port", type=int, help="MCP port (default: found from the Fusion process)")
     ap.add_argument("--out", default=os.path.join(agent_dir(), "bench"),
                     help="folder for results and screenshots (default: <agent folder>/bench, outside the repo)")
+    ap.add_argument("--only", choices=["T0"], help="T0: time the folder protocol alone, without the MCP")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     beat = json.load(open(os.path.join(agent_dir(), "alive.json"), encoding="utf-8-sig"))
+    if a.only == "T0":
+        b = Bench(None, tempfile.mkdtemp(prefix="fa_bench_"))
+        j = b.agent_file(TRIVIAL, "t0")
+        queued = tuple(int(x) for x in str(beat.get("agent", "0")).split(".")[:3]) >= (1, 2, 0)
+        pt = [protocol_round_trip(j, queued) for _ in range(7)]
+        print("T0 folder protocol alone (FusionAgent %s), median of 7: %.3f s %s"
+              % (beat.get("agent"), statistics.median(pt), pt))
+        return 0
     port = a.port or find_mcp_port(beat["pid"])
     if not port:
         print("No MCP server found on the Fusion process. Switch it on in Preferences > General > API, or pass --port.")
@@ -248,6 +286,16 @@ def main():
     print("MCP on port %d, FusionAgent %s" % (port, beat.get("agent")))
     b = Bench(mcp, tempfile.mkdtemp(prefix="fa_bench_"))
     R = {"port": port, "agent_version": beat.get("agent")}
+
+    # T0: the folder protocol alone, from this process: no Python start-up for run_job.py.
+    j = b.agent_file(TRIVIAL, "t0")
+    queued = tuple(int(x) for x in str(beat.get("agent", "0")).split(".")[:3]) >= (1, 2, 0)
+    pt = [protocol_round_trip(j, queued) for _ in range(7)]
+    R["T0_protocol_s"] = {"agent": pt, "agent_median": statistics.median(pt)}
+    print("T0 folder protocol alone, median of 7: FusionAgent %.3f s (%s)" % (statistics.median(pt), pt))
+    if a.only == "T0":
+        print(json.dumps(R["T0_protocol_s"]))
+        return 0
 
     j, s = b.agent_file(TRIVIAL, "t1"), b.mcp_script(TRIVIAL)
     at, mt = [], []

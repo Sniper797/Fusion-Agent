@@ -9,6 +9,8 @@ running it inside Fusion through the FusionAgent add-in:
     python run_job.py path/to/script.py --doc "Car"   # run on that open document, not the active one
     python run_job.py -e "design().timeline.count"    # quick probe, value in out["value"]
     python run_job.py -c "print(doc.name)"            # code without a file
+    python run_job.py path/to/script.py --read-only   # exit 6 if it changed anything
+    python run_job.py doctor                          # first thing to run when something looks wrong
 
 The script runs on Fusion's main thread. Ready-made names: `app`, `ui`, `adsk`,
 `args` (dict), `doc` (the pinned or active document), `out` (dict returned to you), `flush()` (write progress now),
@@ -31,9 +33,12 @@ Import standard modules (`os`, `math`, ...) yourself. Working examples are in `e
 8. Fill an existing hole slightly oversize (+0.05 mm): an exact-radius fill can leave a ~0.1 um slit. `body.volume` carries ~2 ppm noise, so do not chase sub-mm3 differences on large bodies.
 9. Some bodies refuse volume or distance queries (open surfaces, damaged meshes). Wrap such calls in `try_value`.
 10. Pairwise checks grow as n squared. On large assemblies narrow `check_clearance.py` with `only`.
-11. Exit code 3 (busy) is normal when another session shares the add-in: wait and retry. If a job sits in `job.running` and never starts, a modal window is open in Fusion (Scripts and Add-Ins, a save dialog...). Ask the user to close it; never delete another session's job. run_job.py names the blocking window after 3 s.
+11. With add-in 1.2.0+ jobs wait in line ("in line: N job(s) ahead") and `--timeout` covers the wait. Exit code 3 (busy) only comes from older add-ins: wait and retry. If a job sits in `job.running` and never starts, a modal window is open in Fusion (Scripts and Add-Ins, a save dialog...). Ask the user to close it; never delete another session's job. run_job.py names the blocking window after 3 s.
 12. Never walk cloud folders inside a job (recursing `app.data` hubs, projects, folders or file properties). It froze Fusion ("Not Responding") for 9 minutes once and about 40 minutes another time, waiting on the network, until the user restarted it. If a file is not open, ask the user to open it. If its path is known, resolve it level by level with `dataFolders.itemByName`. run_job.py refuses the common forms of such a walk before sending it (exit 5): loops, aliases, helper functions called in loops, recursion. It is a heuristic, so do not rely on it, and never add `--allow cloud-walk` on your own.
 13. Pin every edit with `--doc NAME` (add-in 1.1.0+). `design()`, `doc` and every helper then follow that document even if another session switches tabs, and `save_viewport` refuses when it is not the active one. Without `--doc` everything acts on the ACTIVE document. `ping` lists every document Fusion has loaded, including the ones it loads for referenced parts of an assembly (ARIES: 6 besides its tab; the built-in MCP listed only the tab). `isVisible` was True for all of them, so it does not tell a referenced part from a tab. Never edit a referenced part's document unless the user asked: the change lands in another file they may not have open. A wrong --doc name exits 2.
 14. The joint solver runs after the job ends, so checks inside the job cannot see it. To confirm jointed parts did not move, measure again in a separate job a few seconds later.
 15. Exit code 5: the pre-flight check refused the script. Fix the script instead of adding `--allow`, unless the user agrees. Warnings print before the job runs; read them.
 16. Output longer than 8,000 characters is cut, and the full result's path is printed. Read that file, or return less in `out`.
+17. Read the receipt (`--- changes ---`) after every job. Send jobs that should only read with `--read-only`: exit 6 means something changed, and nothing was undone. The receipt counts documents, components, bodies, timeline and parameters; it does not compare geometry, so a moved part or a feature dimension may show only as isModified.
+18. `journal.jsonl` in the agent folder has one line per finished job from every session: read it before assuming who changed a document.
+19. Laser parts: `examples/laser_dxf.py` writes a DXF per flat part plus cutting sheets per thickness, and checks each file against the model (`cut_length_error_pct`, `area_error_pct`, measured at 0.00-0.01 %). It does no kerf compensation and no real nesting; say so when handing the files over.

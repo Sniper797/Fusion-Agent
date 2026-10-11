@@ -1,21 +1,26 @@
 """FusionAgent - lets any program drive Autodesk Fusion through files.
 
-A background thread watches a folder for job.json. Each job names a Python
-file; the add-in runs it on Fusion's main thread (the Fusion API is not thread
-safe) and writes result.json back. The watcher thread never touches the API.
+A background thread watches a folder for jobs. Each job names a Python file;
+the add-in runs it on Fusion's main thread (the Fusion API is not thread safe)
+and writes the result back. The watcher thread never touches the API.
 
 Folder (override with the FUSION_AGENT_DIR environment variable):
     Windows: %LOCALAPPDATA%\\FusionAgent
     macOS:   ~/Library/Application Support/FusionAgent
 
 Files in that folder:
-    job.json     queued job: {"id", "action": "exec_file" | "ping", "path", "args", "doc"}
-                 "doc" (optional, 1.1.0+) pins the job to the open document of that name
-    job.running  the job being executed (claimed by renaming job.json)
+    queue/<ns>-<id>.json   waiting jobs (1.2.0+), run oldest first:
+                 {"id", "action": "exec_file" | "ping", "path", "args", "doc", "expires",
+                  "read_only", "receipt", "caller"}. A job whose "expires" has passed is
+                 dropped unrun: its client has stopped waiting.
+    job.json     the single job slot that 1.0/1.1 clients use; still served first
+    job.running  the job being executed (claimed by renaming)
     job.done     the last finished job
-    result.json  {"id", "status": "running" | "done" | "error", "out", "stdout", "stderr",
-                  "traceback", "error", "ran_on", "active_before", "active_after"}
-    alive.json   heartbeat, rewritten every half second while the add-in runs
+    result.json  the running or last job: {"id", "status": "running" | "done" | "error",
+                  "out", "stdout", "stderr", "traceback", "error", "ran_on", "changes", ...}
+    results/<id>.json   each finished job's result, so queued clients never miss theirs
+    journal.jsonl        one line per finished job: who sent what, on which document, what changed
+    alive.json   heartbeat, rewritten every second while the add-in runs
 
 SECURITY: this add-in runs any Python file a job points to, with your user's
 rights. Keep the folder private (never in a shared or cloud-synced folder) and
@@ -25,6 +30,7 @@ only run scripts you have read.
 import adsk.core
 import adsk.fusion
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -34,9 +40,11 @@ import threading
 import time
 import traceback
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 EVENT_ID = "FusionAgentJobEvent"
-POLL_SEC = 0.5
+POLL_SEC = 0.05         # how often the watcher looks for a job: a stat call, nothing more
+BEAT_SEC = 1.0          # how often it rewrites alive.json
+JOURNAL_MAX = 2000000   # bytes; the journal then moves to journal.1.jsonl and starts again
 
 
 def _default_dir():
@@ -53,6 +61,20 @@ RUNNING = os.path.join(AGENT_DIR, "job.running")
 DONE = os.path.join(AGENT_DIR, "job.done")
 RESULT = os.path.join(AGENT_DIR, "result.json")
 BEAT = os.path.join(AGENT_DIR, "alive.json")
+QUEUE = os.path.join(AGENT_DIR, "queue")
+RESULTS = os.path.join(AGENT_DIR, "results")
+JOURNAL = os.path.join(AGENT_DIR, "journal.jsonl")
+
+
+def _file_sha(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return None
+
+
+SELF_SHA = _file_sha(__file__)   # what is running; `run_job.py doctor` compares it with what is installed
 
 _app = None
 _ui = None
@@ -272,6 +294,10 @@ class JobInputError(LookupError):
     """A job asked for something that is not there; reported without a traceback."""
 
 
+class ReadOnlyViolation(RuntimeError):
+    """A job sent with --read-only changed something. Detected after the fact, never undone."""
+
+
 def _loose(text):
     return " ".join((text or "").split()).casefold()
 
@@ -312,9 +338,76 @@ def _resolve_doc(name):
 
 def _ping():
     doc = _app.activeDocument
-    return {"agent": VERSION, "fusion": _app.version, "python": sys.version.split()[0],
+    return {"agent": VERSION, "sha": SELF_SHA, "file": __file__,
+            "fusion": _app.version, "python": sys.version.split()[0],
             "agent_dir": AGENT_DIR, "document": doc.name if doc else None,
             "documents": [_doc_info(d) for d in _open_documents()]}
+
+
+def _fingerprint(doc):
+    """Cheap facts that change when a job edits a document. Counts only: no geometry."""
+    info = {"isModified": try_value(lambda: doc.isModified)}
+    d = try_value(lambda: adsk.fusion.Design.cast(doc.products.itemByProductType("DesignProductType")))
+    if d is not None:
+        info["components"] = try_value(lambda: d.allComponents.count)
+        info["occurrences"] = try_value(lambda: d.rootComponent.allOccurrences.count)
+        info["bodies"] = try_value(lambda: sum(c.bRepBodies.count for c in d.allComponents))
+        if try_value(lambda: d.designType) == adsk.fusion.DesignTypes.ParametricDesignType:
+            info["timeline"] = try_value(lambda: [d.timeline.count, d.timeline.markerPosition])
+            info["parameters"] = try_value(lambda: sorted("%s=%s" % (p.name, p.expression)
+                                                          for p in d.userParameters))
+    return info
+
+
+def _doc_key(doc):
+    """Unique per open document. Names are not: two new documents are both "Untitled"."""
+    return try_value(lambda: doc.creationId) or try_value(lambda: doc.name)
+
+
+def _snapshot():
+    """The open documents, the active one, and fingerprints of the active and the pinned one,
+    all keyed by creationId. A document the job closed is simply missing afterwards."""
+    active = _app.activeDocument
+    docs = {}
+    for d in (active, _target):
+        key = _doc_key(d) if d is not None else None
+        name = try_value(lambda: d.name) if d is not None else None
+        if key is not None and name is not None:
+            docs[key] = dict(_fingerprint(d), name=name)
+    open_docs = {}
+    for d in _open_documents():
+        key, name = _doc_key(d), try_value(lambda d=d: d.name)
+        if key is not None:
+            open_docs[key] = name
+    return {"open": open_docs, "active": [_doc_key(active), try_value(lambda: active.name)] if active else None,
+            "docs": docs}
+
+
+def _diff(before, after):
+    """What differs between two snapshots; {} when nothing visible changed. Names label the
+    documents, keys tell them apart."""
+    changes = {}
+    opened = [after["open"][k] for k in after["open"] if k not in before["open"]]
+    closed = [before["open"][k] for k in before["open"] if k not in after["open"]]
+    if opened:
+        changes["opened"] = opened
+    if closed:
+        changes["closed"] = closed
+    ab, aa = before.get("active") or [None, None], after.get("active") or [None, None]
+    if ab[0] != aa[0]:
+        changes["active"] = [ab[1], aa[1] if aa[1] != ab[1] else "%s (another document)" % aa[1]]
+    for key, fb in before["docs"].items():
+        fa = after["docs"].get(key)
+        if fa is None:
+            continue                         # closed: reported above
+        delta = {k: [fb.get(k), fa.get(k)] for k in sorted(set(fb) | set(fa))
+                 if k != "name" and fb.get(k) != fa.get(k)}
+        if "parameters" in delta:            # say which, not the whole list twice
+            b, a = set(delta["parameters"][0] or []), set(delta["parameters"][1] or [])
+            delta["parameters"] = {"removed": sorted(b - a), "added": sorted(a - b)}
+        if delta:
+            changes.setdefault("documents", {})[fa.get("name") or fb.get("name") or key] = delta
+    return changes
 
 
 def _run_job(job, result):
@@ -351,6 +444,9 @@ def _run_job(job, result):
                   "doc": _target or _app.activeDocument,
                   "args": job.get("args") or {}, "out": out, "flush": flush,
                   "agent_dir": AGENT_DIR})
+    t = time.time()
+    before = try_value(_snapshot) if job.get("receipt", True) else None
+    receipt_s = time.time() - t
     flush()
     try:
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
@@ -361,6 +457,14 @@ def _run_job(job, result):
         result["stdout"] = text[-STDOUT_KEEP:]
         result["stdout_truncated"] = len(text) > STDOUT_KEEP
         result["stderr"] = err.getvalue()[-STDOUT_KEEP:]
+        if before is not None:
+            t = time.time()
+            after = try_value(_snapshot)
+            result["changes"] = try_value(lambda: _diff(before, after)) if after else None
+            result["receipt_ms"] = round((receipt_s + time.time() - t) * 1000, 1)
+    if job.get("read_only") and result.get("changes"):
+        raise ReadOnlyViolation("This job was sent with --read-only but changed: %s. Nothing was undone."
+                                % json.dumps(result["changes"], ensure_ascii=False))
 
 
 def _release_log_handlers(buffers):
@@ -406,7 +510,7 @@ def _describe_error(exc, script):
 
 def _record_error(result, exc):
     result["status"] = "error"
-    if isinstance(exc, JobInputError):       # the job's input was wrong, not the code
+    if isinstance(exc, (JobInputError, ReadOnlyViolation)):   # not a bug in the code: no traceback
         result["traceback"] = "%s: %s" % (type(exc).__name__, exc)
         result["error"] = {"type": type(exc).__name__, "message": str(exc)}
         return
@@ -416,9 +520,26 @@ def _record_error(result, exc):
         result["traceback"] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
+def _journal(job, result, started):
+    """One line per finished job, so a session can see later what another one did."""
+    entry = {"id": result.get("id"), "t": round(started, 2), "seconds": result.get("seconds"),
+             "status": result.get("status"), "action": result.get("action"), "script": result.get("script"),
+             "doc": job.get("doc"), "ran_on": (result.get("ran_on") or {}).get("name"),
+             "caller": job.get("caller"), "read_only": bool(job.get("read_only")),
+             "changes": result.get("changes"), "error": (result.get("error") or {}).get("type")}
+    try:
+        if os.path.getsize(JOURNAL) > JOURNAL_MAX:
+            os.replace(JOURNAL, os.path.join(AGENT_DIR, "journal.1.jsonl"))
+    except OSError:
+        pass
+    with io.open(JOURNAL, "a", encoding="utf-8") as f:
+        f.write(_dumps(entry).replace("\n", " ") + "\n")
+
+
 def _execute():
     global _target
     result = {"id": None, "status": "running", "agent": VERSION}
+    job = {}
     t0 = time.time()
     try:
         result["active_before"] = try_value(lambda: _app.activeDocument.name)
@@ -449,6 +570,16 @@ def _execute():
                                      "error": {"type": "ResultNotWritten", "message": repr(e)}})
             except Exception:
                 pass
+        if result.get("id"):                 # its own file: the next job overwrites result.json
+            try:
+                os.makedirs(RESULTS, exist_ok=True)
+                _write_json(os.path.join(RESULTS, "%s.json" % result["id"]), result)
+            except Exception:
+                pass
+        try:
+            _journal(job, result, t0)
+        except Exception:
+            pass
         try:
             os.replace(RUNNING, DONE)
         except Exception:
@@ -475,15 +606,55 @@ class _Watcher(threading.Thread):
         self._stop_event = stop_event
 
     def run(self):
+        last_beat = 0.0
         while not self._stop_event.wait(POLL_SEC):
             try:
-                os.makedirs(AGENT_DIR, exist_ok=True)     # survives the folder being deleted
-                _write_json(BEAT, {"t": time.time(), "pid": os.getpid(), "agent": VERSION})
-                if os.path.isfile(JOB) and not os.path.isfile(RUNNING):
-                    os.replace(JOB, RUNNING)              # claim it, then hand off
+                now = time.time()
+                if now - last_beat >= BEAT_SEC:
+                    os.makedirs(AGENT_DIR, exist_ok=True)     # survives the folder being deleted
+                    _write_json(BEAT, {"t": now, "pid": os.getpid(), "agent": VERSION,
+                                       "sha": SELF_SHA, "file": __file__,
+                                       "features": ["doc", "queue", "receipt"]})
+                    last_beat = now
+                if os.path.isfile(RUNNING):
+                    continue
+                job = _next_job(now)
+                if job:
+                    os.replace(job, RUNNING)              # claim it, then hand off
                     _app.fireCustomEvent(EVENT_ID, "")
             except Exception:
                 pass
+
+
+def _next_job(now):
+    """The legacy job.json first, then the oldest queued job. Queued jobs whose client
+    has stopped waiting are dropped unrun, with a result saying so."""
+    if os.path.isfile(JOB):
+        return JOB
+    try:
+        names = sorted(n for n in os.listdir(QUEUE) if n.endswith(".json"))
+    except OSError:
+        return None
+    for name in names:
+        path = os.path.join(QUEUE, name)
+        try:
+            with io.open(path, "r", encoding="utf-8-sig") as f:
+                job = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if job.get("expires") and job["expires"] < now:
+            try:
+                os.remove(path)
+                os.makedirs(RESULTS, exist_ok=True)
+                _write_json(os.path.join(RESULTS, "%s.json" % job.get("id")),
+                            {"id": job.get("id"), "status": "error", "agent": VERSION,
+                             "error": {"type": "JobExpired", "message": "dropped unrun: its client stopped waiting"},
+                             "traceback": "JobExpired: dropped unrun, its client stopped waiting"})
+            except OSError:
+                pass
+            continue
+        return path
+    return None
 
 
 # --------------------------------------------------------------- add-in entry

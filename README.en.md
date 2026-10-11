@@ -4,7 +4,7 @@ A small Autodesk Fusion add-in that lets any program outside Fusion read the ope
 
 **How it works:**
 1. You write a Python script and run it with `run_job.py`.
-2. `run_job.py` drops a "job" into a folder, and the add-in inside Fusion picks it up within half a second.
+2. `run_job.py` drops a "job" into a folder, and the add-in inside Fusion picks it up within about 0.05 s.
 3. The add-in runs the script and sends the result back as JSON.
 
 Arabic version: [README.md](README.md)
@@ -25,7 +25,8 @@ Arabic version: [README.md](README.md)
 |---|---|
 | `FusionAgent/` | The add-in itself; it goes into Fusion's add-ins folder |
 | `run_job.py` | Sends a script to Fusion and waits for the result |
-| `install-windows.bat` | Copies the add-in into place on Windows |
+| `install.py` | Copies the add-in into place on Windows and macOS, and tells you whether to restart it |
+| `install-windows.bat` | The same on Windows, by double-click |
 | `examples/` | Ready-made examples |
 | `tools/bench_mcp.py` | Measures both routes with the same code: this add-in, and Fusion's built-in MCP |
 | `tests/` | Tests that need no Fusion: `python -m unittest discover -s tests` |
@@ -45,17 +46,17 @@ cd fusion-agent
 ```
 
 **On Windows:**
-1. Run `install-windows.bat`.
+1. Run `python install.py`, or double-click `install-windows.bat`.
 2. In Fusion open **Utilities > Add-Ins** (or Shift+S), find **FusionAgent** in the list, and start it with its run button or the switch next to it. This window looks slightly different between Fusion versions. From then on it starts by itself every time Fusion starts.
-3. Check that it works: `python run_job.py ping` prints every document Fusion has loaded, and which one is active. That includes documents Fusion loads for referenced parts of your assembly even though you never opened them: one assembly with referenced parts had six of them besides its open tab.
+3. Check that everything is fine: `python run_job.py doctor`. It checks Python, the installed and the running copy, a window holding the jobs, sends a test job, and says what to do about each problem. `python run_job.py ping` prints every document Fusion has loaded, and which one is active. That includes documents Fusion loads for referenced parts of your assembly even though you never opened them: one assembly with referenced parts had six of them besides its open tab.
 
 > **`run_job.py` does not go into Fusion.** Don't add it to the Scripts and Add-Ins list; running it from there does nothing. It is the sender: it runs from a terminal (cmd, PowerShell or Terminal), or Claude Code runs it. The only thing that goes into Fusion is the `FusionAgent` add-in.
 
-**On macOS:** copy the `FusionAgent` folder to
+**On macOS:** run `python3 install.py`, which copies the folder to
 `~/Library/Application Support/Autodesk/Autodesk Fusion 360/API/AddIns/`
-then do steps 2 and 3.
+then do steps 2 and 3. This has not been tried on a Mac yet.
 
-**Updating:** run `git pull`, run `install-windows.bat` again, then restart Fusion. The add-in is a copy inside Fusion's folder, so it does not update when the repository does. `run_job.py` tells you when the installed add-in is older than itself. To restart the add-in without closing Fusion: Shift+S, then stop FusionAgent and run it again.
+**Updating:** run `git pull`, then `python install.py`, then restart the add-in. The add-in is a copy inside Fusion's folder, so it does not update when the repository does. `run_job.py doctor` tells you when the installed or the running copy is older than the package. To restart the add-in without closing Fusion: Shift+S, then stop FusionAgent and run it again.
 
 ## Usage
 
@@ -67,12 +68,15 @@ python run_job.py examples/export_stl.py --args-file my_args.json --save result.
 python run_job.py examples/inspect_design.py --doc "Car"
 python run_job.py -c "print(design().rootComponent.name)"
 python run_job.py -e "design().timeline.count"
+python run_job.py examples/inspect_design.py --read-only
+python run_job.py doctor
 ```
 
 - `-c` sends code without a file, and `-e` sends one expression whose value comes back in `out["value"]`.
 - **What it prints:** what the script printed, then `out`.
 - **Long output** is cut at 8,000 characters (`--print-limit`), and the full result is saved to a file whose path is printed.
 - **If the script fails,** it prints the error with your script's own lines only, plus a hint when it matches a known trap.
+- **After every job** it prints what changed in the document; see "Queue and change receipt" below.
 
 **Exit codes:**
 
@@ -81,9 +85,10 @@ python run_job.py -e "design().timeline.count"
 | 0 | Done |
 | 1 | The script raised an error |
 | 2 | The add-in is not running, or the input is wrong, including a `--doc` name that matches no open document |
-| 3 | The add-in is busy with another job |
+| 3 | The add-in is busy with another job. Only with add-ins older than 1.2.0; newer ones queue the job |
 | 4 | Timed out |
 | 5 | Refused by the pre-flight check, so it was not sent |
+| 6 | A job sent with `--read-only` changed something. Nothing was undone |
 
 ## Choose the document: `--doc`
 
@@ -100,6 +105,17 @@ python run_job.py examples/inspect_design.py --doc "Car"
 - **What it prints:** `run_job.py` names the document the job ran on, and warns when the active document changed during the job.
 - **For a whole session:** put the name in the `FUSION_AGENT_DOC` environment variable.
 - It needs add-in 1.1.0 or newer.
+
+## Queue and change receipt
+
+With add-in 1.2.0 or newer:
+
+- **Queue:** when another job is running, from your session or another one, yours waits its turn and prints "in line: 1 job(s) ahead". `--timeout` covers the wait. If it runs out first, the job is taken out of the queue and never runs. If the client dies, the add-in drops the job once its time is up.
+- **Speed:** the add-in checks the folder every 0.05 s instead of 0.5. A tiny job from the terminal went from 0.49 s to 0.13 s, and the protocol alone from 0.51 s to 0.06 s. A check pass costs about 0.1% of one core.
+- **Change receipt:** after every job, `run_job.py` prints what changed in the active and the pinned document: a document opened or closed, the active document, the modified flag, the timeline's length and marker, components, bodies and user parameters. When nothing did, it says `changes: none seen`.
+- **The receipt's limits:** it counts things; it does not compare geometry. Moving a part, or changing a dimension inside a feature without adding anything, may show only as the modified flag. `--no-receipt` skips it.
+- **`--read-only`:** if the receipt sees any change, the job fails with exit code 6. This detects after the fact; it undoes nothing.
+- **Journal:** every finished job adds a line to `journal.jsonl` in the add-in's folder: who sent it (folder and process), which script, on which document, what changed, and the error type. Useful when several sessions share the add-in.
 
 ## Pre-flight check
 
@@ -127,6 +143,7 @@ python run_job.py examples/inspect_design.py --doc "Car"
 | `screenshot.py` | A picture of the view; parts can be hidden for the shot and shown again | No, and it restores the camera |
 | `demo_scene.py` | A **new** document with a mount, a pin and a gear to experiment on | Only creates a new document |
 | `snap_fit.py` | Turns the pin into a snap-fit, and opens a bore with a catch groove in the part | Yes, as one group at the end of the timeline |
+| `laser_dxf.py` | A laser DXF for every flat part, cutting sheets per thickness, and each file checked against the model | No |
 
 **Try the snap-fit without touching your own designs.** Run these steps without `--doc` and with `FUSION_AGENT_DOC` unset: `demo_scene.py` makes the new document the active one, and the steps after it work on the active document.
 
@@ -140,6 +157,20 @@ python run_job.py examples/check_clearance.py
 - **The first check** finds the pin inside the gear: 904.779 mm³ of interference.
 - **After the snap-fit:** zero interference, and a smallest gap of 0.2 mm.
 - **When you are done:** close the demo document without saving.
+
+### Laser files: `laser_dxf.py`
+
+```
+python run_job.py examples/laser_dxf.py
+python run_job.py examples/laser_dxf.py --args "{\"bed\": [600, 400]}"
+python run_job.py examples/laser_dxf.py --args "{\"demo\": true}"
+```
+
+- **What counts as a part:** a solid with two parallel flat faces and every other face square to them. Parts thicker than 20 mm (`max_thickness`) are skipped, with the reason.
+- **What it writes:** a DXF in mm for each part, from its larger flat face: real lines, arcs and circles, other curves as short lines. Then cutting sheets the size of the laser bed (`bed`, 1300 x 900 by default) per thickness, parts in rows 5 mm apart, turned 90 degrees when that is what fits.
+- **What it checks:** the cut length in the file against the face's edge lengths, the area inside the outline against the face's area, and it reads each file back. On the demo shapes the largest disagreement was 0.0092%; on a plate inside a component turned 30 degrees and moved, 0.0017%.
+- **`demo`:** builds three shapes in memory, so you can try it without any design.
+- **Not done yet:** kerf compensation (cut a coupon on your machine and offset in the laser software), and nesting that saves material: the rows are a check that parts fit the bed more than a layout.
 
 ## Write your own script
 
@@ -194,7 +225,7 @@ The add-in runs **any** Python file a job points to, with your account's rights 
 ## Known issues
 
 - **"FusionAgent is not running":** Fusion is closed, or the add-in is stopped. Start it from Shift+S.
-- **"busy":** another job is running right now, possibly from another session using the same add-in, since jobs run one at a time. If a window open in Fusion, such as Scripts and Add-Ins, is holding the jobs, `run_job.py` names it after three seconds, and the job starts by itself once you close it. If Fusion crashes during a job, the add-in cleans up after it the next time Fusion starts.
+- **"busy":** only with add-ins older than 1.2.0: another job is running right now, possibly from another session. With 1.2.0 the job waits its turn in the queue. If a window open in Fusion, such as Scripts and Add-Ins, is holding the jobs, `run_job.py` names it after three seconds, and the job starts by itself once you close it. If Fusion crashes during a job, the add-in cleans up after it the next time Fusion starts.
 - **Timed out:** usually a dialog open in Fusion is blocking it, so close it. For long jobs use `--timeout 600`.
 - **Paths inside `args`:** write them as `C:/...`. A Git Bash path such as `/c/Users/...` used to fail silently; `run_job.py` now rewrites it.
 - **Fusion's interface freezes:** the script runs on Fusion's main thread, so the interface stops until it finishes. Split long work into parts.
@@ -208,12 +239,14 @@ Fusion ships an official MCP server, switched on in Preferences > General > API.
 
 | | FusionAgent | Built-in MCP |
 |---|---|---|
-| Round trip for a tiny job | 0.4 to 0.9 s, waiting on files | about 0.05 s |
+| Round trip for a tiny job | 0.06 s for the protocol alone, 0.13 s from the terminal (1.2.0; it was 0.5 s) | 0.03 to 0.05 s |
 | Inspecting 633 bodies | Identical result body by body; the work inside Fusion takes the same time | |
 | Progress during a long job | Step by step through `flush()` | Nothing until the end |
 | Errors | Your script's lines and source, plus a structured error | Line numbers without source |
 | Scripts are files with `args` | Yes | No, code text sent every time |
 | Runs while a command such as Sketch is open | No | Yes, read-only |
+| Prints what changed after every job | Yes | No |
+| Laser DXF files from the design | Yes, `laser_dxf.py` | No |
 
 Re-measure on your machine: `python tools/bench_mcp.py`. It finds the MCP port by itself and only reads.
 

@@ -9,13 +9,19 @@
     python run_job.py -c "print(design().rootComponent.name)"   code without a file
     python run_job.py -e "design().timeline.count"              one expression, returned as out["value"]
     python run_job.py SCRIPT.py --timeout 300 --save result.json
+    python run_job.py SCRIPT.py --read-only         fail if the job changed anything (nothing is undone)
+    python run_job.py doctor                        check the whole chain and say what to fix
 
 Before sending, the script is checked without contacting Fusion. Patterns that have
 frozen Fusion before are refused (exit 5); --allow RULE or --no-preflight overrides.
 
+With add-in 1.2.0+ jobs wait in line instead of failing as busy, and every result
+lists what changed in the active and the pinned document (--no-receipt skips it).
+
 Exit code: 0 done, 1 the script raised (traceback printed), 2 agent not running
-or bad input (including a --doc that matches no open document), 3 agent busy,
-4 timed out, 5 refused by the pre-flight check.
+or bad input (including a --doc that matches no open document), 3 agent busy
+(add-ins older than 1.2.0), 4 timed out, 5 refused by the pre-flight check,
+6 a --read-only job changed something.
 Standard library only.
 """
 import argparse
@@ -27,8 +33,9 @@ import sys
 import time
 import uuid
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 NEEDS_FOR_DOC = (1, 1, 0)
+NEEDS_FOR_QUEUE = (1, 2, 0)
 KEEP_SECONDS = 2 * 24 * 3600        # inline scripts and saved results older than this are swept
 
 # ------------------------------------------------------------- pre-flight check
@@ -354,13 +361,214 @@ def sweep(folder):
         pass
 
 
+def addins_dir():
+    """Where Fusion looks for add-ins on this computer."""
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/Autodesk/Autodesk Fusion 360/API/AddIns")
+    return os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
+                        "Autodesk", "Autodesk Fusion 360", "API", "AddIns")
+
+
+def package_addin():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "FusionAgent", "FusionAgent.py")
+
+
+def file_sha(path):
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return None
+
+
+def file_version(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            m = re.search(r'^VERSION = "([^"]+)"', f.read(), re.M)
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
+def queue_dir(d):
+    return os.path.join(d, "queue")
+
+
+def jobs_ahead(d, mine=None):
+    """Jobs that run before ours: the one running now, plus older queued ones."""
+    try:
+        names = sorted(n for n in os.listdir(queue_dir(d)) if n.endswith(".json"))
+    except OSError:
+        names = []
+    ahead = [n for n in names if mine is None or n < os.path.basename(mine)]
+    busy = os.path.exists(os.path.join(d, "job.running")) or os.path.exists(os.path.join(d, "job.json"))
+    return len(ahead) + (1 if busy else 0)
+
+
+def submit(d, job, queued):
+    """Queue the job (add-in 1.2.0+), or use the single job.json slot older add-ins read."""
+    if queued:
+        os.makedirs(queue_dir(d), exist_ok=True)
+        path = os.path.join(queue_dir(d), "%020d-%s.json" % (time.time_ns(), job["id"]))
+    else:
+        path = os.path.join(d, "job.json")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(job, f, ensure_ascii=False)
+    os.replace(tmp, path)
+    return path
+
+
+def wait_for(d, job, timeout, pid, quiet=False):
+    """Poll for the job's result every 50 ms. Returns (result or None, finished?)."""
+    final = os.path.join(d, "results", job["id"] + ".json")
+    live = os.path.join(d, "result.json")
+    t0, last, seen_mtime, warned = time.time(), None, None, False
+    while time.time() - t0 < timeout:
+        time.sleep(0.05)
+        if os.path.exists(final):
+            r = read_json(final)
+            if r and r.get("status") in ("done", "error"):
+                return r, True
+        try:
+            mtime = os.stat(live).st_mtime_ns
+        except OSError:
+            mtime = None
+        if mtime != seen_mtime:              # parse only when the file changed
+            seen_mtime = mtime
+            r = read_json(live)
+            if r and r.get("id") == job["id"]:
+                last = r
+                if r.get("status") in ("done", "error"):
+                    return r, True
+        if not warned and last is None and time.time() - t0 > 3:
+            warned = True                    # not started after 3 s: why?
+            blocked = blocking_windows(pid)
+            if blocked:
+                print(say_blocked(blocked), flush=True)
+            elif not quiet and job.get("queue_file") and os.path.exists(job["queue_file"]):
+                print("waiting in line: %d job(s) ahead" % jobs_ahead(d, job["queue_file"]), flush=True)
+    return last, False
+
+
+def print_changes(changes):
+    if changes is None:
+        return
+    if not changes:
+        print("changes: none seen (open documents, modified flag, timeline, components, bodies, parameters)")
+        return
+    print("--- changes ---")
+    for key in ("opened", "closed"):
+        if changes.get(key):
+            print("%s: %s" % (key, ", ".join(changes[key])))
+    if changes.get("active"):
+        print("active document: %s -> %s" % tuple(changes["active"]))
+    for name, delta in (changes.get("documents") or {}).items():
+        parts = []
+        for field, v in delta.items():
+            if field == "parameters":
+                parts.append("parameters added %s, removed %s" % (v.get("added"), v.get("removed")))
+            else:
+                parts.append("%s %s -> %s" % (field, v[0], v[1]))
+        print("%s: %s" % (name, "; ".join(parts)))
+
+
+def doctor(d):
+    """Check the whole chain and say what to do. Exit 0 when nothing failed."""
+    fails = []
+
+    def say(level, msg):
+        print("%-5s %s" % (level, msg))
+        if level == "FAIL":
+            fails.append(msg)
+
+    say("ok" if sys.version_info >= (3, 8) else "FAIL", "Python %s (needs 3.8+)" % sys.version.split()[0])
+    synced = [s for s in ("OneDrive", "Dropbox", "iCloud", "Google Drive") if s.lower() in d.lower()]
+    say("WARN" if synced else "ok", "job folder %s%s" % (d, " is inside %s: keep it private" % synced[0] if synced else ""))
+
+    package, installed = package_addin(), os.path.join(addins_dir(), "FusionAgent", "FusionAgent.py")
+    pv, iv = file_version(package), file_version(installed)
+    ps, ins = file_sha(package), file_sha(installed)
+    say("ok", "this package: client %s, add-in %s" % (VERSION, pv or "?"))
+    if not os.path.isfile(installed):
+        say("FAIL", "not installed in %s: run python install.py" % os.path.dirname(installed))
+    elif ps and ins != ps:
+        say("WARN", "installed add-in %s differs from this package's %s: run python install.py, then restart "
+                    "FusionAgent (Shift+S: stop, run)" % (iv, pv))
+    else:
+        say("ok", "installed add-in %s matches this package" % iv)
+
+    beat = read_json(os.path.join(d, "alive.json"))
+    if not beat:
+        say("FAIL", "no heartbeat: Fusion is closed or FusionAgent is not running (Shift+S, find FusionAgent, run)")
+        return 2
+    age = time.time() - beat.get("t", 0)
+    if age > 5:
+        say("FAIL", "heartbeat is %.0f s old: FusionAgent stopped, or Fusion is frozen" % age)
+        blocked = blocking_windows(beat.get("pid"))
+        if blocked:
+            say("FAIL", say_blocked(blocked))
+        return 2
+    say("ok", "FusionAgent %s running in Fusion (pid %s), heartbeat %.1f s ago"
+        % (beat.get("agent"), beat.get("pid"), age))
+    running_v = beat.get("agent")
+    if beat.get("sha") and ins and beat["sha"] != ins:
+        if version_tuple(running_v) < version_tuple(iv):
+            say("WARN", "Fusion runs %s but %s is installed: restart FusionAgent (Shift+S: stop, run)"
+                % (running_v, iv))
+        else:
+            say("WARN", "Fusion runs a different copy (%s) than the installed file (%s), loaded from %s"
+                % (running_v, iv, beat.get("file") or "outside the add-ins folder"))
+    elif not beat.get("sha") and iv and version_tuple(running_v) < version_tuple(iv):
+        say("WARN", "Fusion runs %s but %s is installed: restart FusionAgent (Shift+S: stop, run)" % (running_v, iv))
+
+    blocked = blocking_windows(beat.get("pid"))
+    if blocked:
+        say("FAIL", say_blocked(blocked))
+    running = os.path.join(d, "job.running")
+    if os.path.exists(running):
+        held = time.time() - os.path.getmtime(running)
+        say("WARN" if held > 60 else "ok", "a job has been running for %.0f s%s" % (
+            held, ": a long job, or a window holds it" if held > 60 else ""))
+    waiting = jobs_ahead(d)
+    if waiting:
+        say("ok", "%d job(s) in line" % waiting)
+    abandoned = os.path.join(d, "job.abandoned")
+    if os.path.exists(abandoned):
+        hours = (time.time() - os.path.getmtime(abandoned)) / 3600
+        say("note", "a job was cut off when Fusion closed or crashed, %.1f hours ago (job.abandoned)" % hours)
+    if fails:
+        return 2
+
+    job = {"id": uuid.uuid4().hex, "action": "ping", "caller": {"cwd": os.getcwd(), "pid": os.getpid()}}
+    queued = version_tuple(beat.get("agent")) >= NEEDS_FOR_QUEUE
+    if not queued and waiting:
+        say("WARN", "skipped the test job: the add-in is busy and too old to queue")
+        return 0
+    job["queue_file"] = submit(d, job, queued) if queued else None
+    if not queued:
+        submit(d, job, False)
+    t = time.time()
+    r, done = wait_for(d, job, 20, beat.get("pid"), quiet=True)
+    if done and r.get("status") == "done":
+        out = r.get("out") or {}
+        say("ok", "test job answered in %.2f s: Fusion %s, active document %r, %d loaded"
+            % (time.time() - t, out.get("fusion"), out.get("document"), len(out.get("documents") or [])))
+        return 0
+    if job.get("queue_file") and os.path.exists(job["queue_file"]):
+        os.remove(job["queue_file"])
+    say("FAIL", "the test job got no answer in 20 s")
+    return 2
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
     p = argparse.ArgumentParser(description="Run a Python script inside Autodesk Fusion via FusionAgent.")
-    p.add_argument("script", nargs="?", help='a .py file to run inside Fusion, or "ping"')
+    p.add_argument("script", nargs="?", help='a .py file to run inside Fusion, "ping", or "doctor"')
     p.add_argument("-c", "--code", help='Python code to run instead of a file ("-" reads it from stdin)')
     p.add_argument("-e", "--eval", dest="expr", help='one expression; its value comes back as out["value"]')
     p.add_argument("--args", help="JSON object passed to the script as `args`")
@@ -368,7 +576,10 @@ def main():
     p.add_argument("--doc", default=os.environ.get("FUSION_AGENT_DOC"),
                    help="run on this open document (tab name, or file name without the version) instead of "
                         "the active one; default: the FUSION_AGENT_DOC environment variable")
-    p.add_argument("--timeout", type=float, default=120, help="seconds to wait (default 120)")
+    p.add_argument("--read-only", action="store_true",
+                   help="fail (exit 6) when the job changes anything the receipt can see; nothing is undone")
+    p.add_argument("--no-receipt", action="store_true", help="skip the before/after check of the documents")
+    p.add_argument("--timeout", type=float, default=120, help="seconds to wait, in line and running (default 120)")
     p.add_argument("--save", help="also write the full result JSON to this file")
     p.add_argument("--print-limit", type=int, default=8000,
                    help="print at most this many characters of out and of printed output (0: no limit)")
@@ -378,14 +589,17 @@ def main():
 
     sources = [x for x in (a.script, a.code, a.expr) if x is not None]
     if len(sources) != 1:
-        p.error("give exactly one of: SCRIPT, ping, -c CODE, -e EXPRESSION")
+        p.error("give exactly one of: SCRIPT, ping, doctor, -c CODE, -e EXPRESSION")
 
     d = agent_dir()
+    if a.script == "doctor":
+        return doctor(d)
     beat = read_json(os.path.join(d, "alive.json"))
     if not beat or time.time() - beat.get("t", 0) > 5:
         print("FusionAgent is not running (no fresh heartbeat in %s)." % d)
         print("Open Fusion, then Utilities > Add-Ins (Shift+S): find FusionAgent in the list and run it.")
         print("(This file, run_job.py, is not added to Fusion; it runs from a terminal.)")
+        print("For a full check: python run_job.py doctor")
         return 2
     installed = beat.get("agent", "0")
     if a.doc is not None and a.script == "ping":
@@ -396,21 +610,25 @@ def main():
         return 2
     if a.doc and version_tuple(installed) < NEEDS_FOR_DOC:
         print("--doc needs FusionAgent 1.1.0 or newer, and the installed add-in is %s." % installed)
-        print("Run install-windows.bat, then in Fusion (Shift+S) stop FusionAgent and run it again.")
+        print("Run python install.py, then in Fusion (Shift+S) stop FusionAgent and run it again.")
+        return 2
+    queued = version_tuple(installed) >= NEEDS_FOR_QUEUE
+    if a.read_only and not queued:
+        print("--read-only needs FusionAgent 1.2.0 or newer, and the installed add-in is %s." % installed)
+        print("Run python install.py, then in Fusion (Shift+S) stop FusionAgent and run it again.")
         return 2
     if version_tuple(installed) < version_tuple(VERSION):
-        print("note: the installed add-in is %s and this package is %s. Run install-windows.bat, "
+        print("note: the installed add-in is %s and this package is %s. Run python install.py, "
               "then stop and run FusionAgent in Fusion (Shift+S)." % (installed, VERSION))
 
-    job_path = os.path.join(d, "job.json")
-    if os.path.exists(job_path) or os.path.exists(os.path.join(d, "job.running")):
+    if not queued and (os.path.exists(os.path.join(d, "job.json")) or os.path.exists(os.path.join(d, "job.running"))):
         print("FusionAgent is busy with another job. Try again when it finishes.")
         blocked = blocking_windows(beat.get("pid"))
         if blocked:
             print(say_blocked(blocked))
         return 3
 
-    job = {"id": uuid.uuid4().hex}
+    job = {"id": uuid.uuid4().hex, "caller": {"cwd": os.getcwd(), "pid": os.getpid()}}
     if a.script == "ping":
         job["action"] = "ping"
     else:
@@ -471,33 +689,38 @@ def main():
         job.update({"action": "exec_file", "path": script, "args": args})
         if a.doc:
             job["doc"] = a.doc
+        if a.read_only:
+            job["read_only"] = True
+        if a.no_receipt:
+            job["receipt"] = False
 
-    tmp = job_path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(job, f, ensure_ascii=False)
-    os.replace(tmp, job_path)
+    if queued:
+        job["expires"] = time.time() + a.timeout + 5          # dropped unrun if we have stopped waiting
+        job["queue_file"] = submit(d, job, True)
+        ahead = jobs_ahead(d, job["queue_file"])
+        if ahead:
+            print("in line: %d job(s) ahead" % ahead, flush=True)
+    else:
+        submit(d, job, False)
 
-    t0 = time.time()
-    last = None
-    warned = False
-    while time.time() - t0 < a.timeout:
-        time.sleep(0.3)
-        r = read_json(os.path.join(d, "result.json"))
-        if r and r.get("id") == job["id"]:
-            last = r
-            if r.get("status") in ("done", "error"):
-                break
-        elif not warned and time.time() - t0 > 3:
-            warned = True                    # not started after 3 s: is a window holding the queue?
+    last, finished = wait_for(d, job, a.timeout, beat.get("pid"))
+    if not finished:
+        qf = job.get("queue_file")
+        if qf:
+            try:
+                os.remove(qf)
+                print("Gave up after %.0f s in line; the job was taken out of the queue and never ran." % a.timeout)
+                return 4
+            except OSError:
+                pass                         # the add-in took it meanwhile
+        if last is None:
+            print("No result after %.0f s." % a.timeout)
             blocked = blocking_windows(beat.get("pid"))
-            if blocked:
-                print(say_blocked(blocked), flush=True)
-
-    if last is None:
-        print("No result after %.0f s." % a.timeout)
-        blocked = blocking_windows(beat.get("pid"))
-        print(say_blocked(blocked) if blocked else "Fusion may be busy or showing a dialog.")
-        return 4
+            print(say_blocked(blocked) if blocked else "Fusion may be busy or showing a dialog.")
+            if queued:
+                print("If it still runs, its result will land in %s"
+                      % os.path.normpath(os.path.join(d, "results", job["id"] + ".json")))
+            return 4
 
     results = os.path.join(d, "results")
     os.makedirs(results, exist_ok=True)
@@ -516,7 +739,7 @@ def main():
         if ran.get("isVisible") is False:
             where.append("isVisible is false")
         print("ran on: %s%s" % (ran.get("name"), " (%s)" % "; ".join(where) if where else ""))
-    if "active_after" in last and last.get("active_before") != last.get("active_after"):
+    if "changes" not in last and "active_after" in last and last.get("active_before") != last.get("active_after"):
         print("warning: the active document changed during the job: %s -> %s"
               % (last.get("active_before"), last.get("active_after")))
     cut_any = False
@@ -543,13 +766,18 @@ def main():
             print(text)
     if cut_any:
         print("--- full result: %s ---" % full)
+    if last.get("action") != "ping" and last.get("status") != "running":
+        print_changes(last.get("changes"))
     if last.get("status") == "error":
         print("--- error ---")
         print(last.get("traceback", "").rstrip())
         for h in hints_for(last.get("traceback", "")):
             print("hint: " + h)
-        if (last.get("error") or {}).get("type") == "JobInputError":
+        kind = (last.get("error") or {}).get("type")
+        if kind == "JobInputError":
             return 2                         # a wrong --doc is bad input, not a failing script
+        if kind == "ReadOnlyViolation":
+            return 6
         return 1
     if last.get("status") != "done":
         print("--- still running after %.0f s; partial result above ---" % a.timeout)
