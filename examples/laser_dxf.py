@@ -21,10 +21,13 @@ args:
     bed            [width, height] of the laser bed in mm (default [1300, 900])
     gap            mm between parts on a sheet (default 5)
     max_thickness  thicker parts are skipped, in mm (default 20)
+    kerf_mm        the laser's cut width, baked into the files (default 0: no offset). Outlines
+                   move out and holes in by half of it, so parts come out at model size; set the
+                   laser's own offset to 0. A 20 mm coupon file comes with it: cut it first,
+                   measure it, and real kerf = 20 + kerf_mm - your reading.
     demo           true: export three built-in test shapes instead of the design
 
-Not done here: kerf compensation (cut the coupon on your machine and offset in the laser
-software) and real nesting (the sheets are simple rows, a fit check more than a layout).
+Not done here: real nesting (the sheets are simple rows, a fit check more than a layout).
 """
 import math
 import os
@@ -40,6 +43,8 @@ only = set(args.get("only") or [])
 exclude = [x.lower() for x in args.get("exclude") or []]
 sheet_mm = {k.lower(): float(v) for k, v in (args.get("sheet_mm") or {}).items()}
 PRISM_TOL = 0.002          # volume may differ from outline area x thickness by 0.2 %, no more
+kerf = float(args.get("kerf_mm", 0))
+tag = (" kerf%.2f-offset0" % kerf).replace(".", "p") if kerf > 0 else ""   # the Center's file naming
 
 
 # ------------------------------------------------------------------ the parts
@@ -102,37 +107,124 @@ def ccw_sweep(a0, a1):
     return (a1 - a0) % 360.0
 
 
+def edge_entities(e, o, u, v):
+    """DXF entities for one edge, in mm: a line, an arc, a circle, or short lines for the rest."""
+    ev = e.evaluator
+    ok, t0, t1 = ev.getParameterExtents()
+    ok, ps = ev.getPointAtParameter(t0)
+    ok, pm = ev.getPointAtParameter((t0 + t1) / 2)
+    ok, pe = ev.getPointAtParameter(t1)
+    g = e.geometry
+    line, arc, circle = adsk.core.Line3D.cast(g), adsk.core.Arc3D.cast(g), adsk.core.Circle3D.cast(g)
+    if line:
+        return [("LINE", to2d(ps, o, u, v), to2d(pe, o, u, v))]
+    if circle:
+        return [("CIRCLE", to2d(circle.center, o, u, v), circle.radius * 10.0)]
+    if arc:
+        c = to2d(arc.center, o, u, v)
+        a_s, a_m, a_e = (angle(c, to2d(p, o, u, v)) for p in (ps, pm, pe))
+        if ccw_sweep(a_s, a_m) <= ccw_sweep(a_s, a_e):           # counter-clockwise start -> end
+            return [("ARC", c, arc.radius * 10.0, a_s, a_e)]
+        return [("ARC", c, arc.radius * 10.0, a_e, a_s)]
+    ok, pts = ev.getStrokes(t0, t1, 0.001)                     # splines, ellipses: short lines
+    pts = [to2d(p, o, u, v) for p in pts]
+    return [("LINE", a, b) for a, b in zip(pts, pts[1:])]
+
+
 def entities_of(face, n):
     """DXF entities for every edge of the face, in mm, plus the measured lengths."""
     o, u, v = frame(face, n)
     ents, model_len = [], 0.0
     for loop in face.loops:
         for co in loop.coEdges:
-            e = co.edge
-            model_len += e.length * 10.0
+            model_len += co.edge.length * 10.0
+            ents += edge_entities(co.edge, o, u, v)
+    return ents, model_len
+
+
+def strokes(edges, tol=0.0005):
+    pts = []
+    for e in edges:
+        ev = e.evaluator
+        ok, t0, t1 = ev.getParameterExtents()
+        ok, seg = ev.getStrokes(t0, t1, tol)
+        pts += list(seg)
+    return pts
+
+
+def distance_to_edges(p, edges):
+    """Distance from p to the nearest of the model's own edges, on the exact curves: a
+    polyline stand-in would add its own chord error, which is as big as what is measured."""
+    best = float("inf")
+    for e in edges:
+        g = e.geometry
+        line, arc, circle = adsk.core.Line3D.cast(g), adsk.core.Arc3D.cast(g), adsk.core.Circle3D.cast(g)
+        if circle:                           # exact: no parameter search, which fails off the curve
+            best = min(best, abs(circle.center.distanceTo(p) - circle.radius))
+            continue
+        if line:
+            a, b = e.startVertex.geometry, e.endVertex.geometry
+            ab, ap = a.vectorTo(b), a.vectorTo(p)
+            L2 = ab.dotProduct(ab)
+            t = 0.0 if L2 == 0 else max(0.0, min(1.0, ap.dotProduct(ab) / L2))
+            best = min(best, P(a.x + ab.x * t, a.y + ab.y * t, a.z + ab.z * t).distanceTo(p))
+            continue
+        if arc:
+            ref = arc.referenceVector.copy()
+            ref.normalize()
+            side = arc.normal.crossProduct(ref)
+            cp = arc.center.vectorTo(p)
+            a = math.atan2(cp.dotProduct(side), cp.dotProduct(ref)) % (2 * math.pi)
+            lo, hi = arc.startAngle % (2 * math.pi), arc.endAngle
+            sweep = (hi - arc.startAngle) % (2 * math.pi) or 2 * math.pi
+            if (a - lo) % (2 * math.pi) <= sweep:
+                best = min(best, abs(arc.center.distanceTo(p) - arc.radius))
+                continue
+        ev = e.evaluator                     # arc ends, and every other curve
+        ok, t0, t1 = ev.getParameterExtents()
+        ok, t = ev.getParameterAtPoint(p)
+        for t in [t0, t1] + ([min(max(t, t0), t1)] if ok else []):
+            ok, q = ev.getPointAtParameter(t)
+            if ok:
+                best = min(best, q.distanceTo(p))
+    return best
+
+
+def kerf_entities(face, n, kerf_mm):
+    """Every loop moved half the kerf away from the material, by Fusion's own wire offset:
+    outlines grow, holes shrink, sharp corners stay sharp. Returns the entities and the measured
+    distance (mm) between each moved loop and the model's, sampled along the moved one."""
+    tbm = adsk.fusion.TemporaryBRepManager.get()
+    o, u, v = frame(face, n)
+    d = kerf_mm / 20.0                                          # half the kerf, in cm
+    ents, dist = [], []
+
+    def diag(body):
+        bb = body.boundingBox
+        return bb.minPoint.distanceTo(bb.maxPoint)
+
+    for loop in face.loops:
+        wire_body = tbm.createWireFromCurves([co.edge.geometry for co in loop.coEdges], False)[0]
+        moved_ = None
+        for sign in (1, -1):                                    # the side that grows an outline, shrinks a hole
+            r = wire_body.wires.item(0).offsetPlanarWire(n, sign * d, adsk.fusion.OffsetCornerTypes.ExtendedOffsetCornerType)
+            if (diag(r) > diag(wire_body)) == loop.isOuter:
+                moved_ = r
+                break
+        if moved_ is None:
+            raise RuntimeError("the kernel could not move a loop of this part by the kerf")
+        for e in moved_.edges:
+            ents += edge_entities(e, o, u, v)
+        model_edges = [co.edge for co in loop.coEdges]
+        for e in moved_.edges:               # inside each edge: a line's strokes are only its two corners
             ev = e.evaluator
             ok, t0, t1 = ev.getParameterExtents()
-            ok, ps = ev.getPointAtParameter(t0)
-            ok, pm = ev.getPointAtParameter((t0 + t1) / 2)
-            ok, pe = ev.getPointAtParameter(t1)
-            g = e.geometry
-            line, arc, circle = adsk.core.Line3D.cast(g), adsk.core.Arc3D.cast(g), adsk.core.Circle3D.cast(g)
-            if line:
-                ents.append(("LINE", to2d(ps, o, u, v), to2d(pe, o, u, v)))
-            elif circle:
-                ents.append(("CIRCLE", to2d(circle.center, o, u, v), circle.radius * 10.0))
-            elif arc:
-                c = to2d(arc.center, o, u, v)
-                a_s, a_m, a_e = (angle(c, to2d(p, o, u, v)) for p in (ps, pm, pe))
-                if ccw_sweep(a_s, a_m) <= ccw_sweep(a_s, a_e):   # counter-clockwise start -> end
-                    ents.append(("ARC", c, arc.radius * 10.0, a_s, a_e))
-                else:
-                    ents.append(("ARC", c, arc.radius * 10.0, a_e, a_s))
-            else:                                               # splines, ellipses: short lines
-                ok, pts = ev.getStrokes(t0, t1, 0.001)
-                pts = [to2d(p, o, u, v) for p in pts]
-                ents += [("LINE", a, b) for a, b in zip(pts, pts[1:])]
-    return ents, model_len
+            for k in range(1, 8):
+                ok, p = ev.getPointAtParameter(t0 + (t1 - t0) * k / 8)
+                if ok:
+                    dist.append(distance_to_edges(p, model_edges) * 10.0)
+    dist.sort()
+    return ents, {"median": round(dist[len(dist) // 2], 4), "min": round(dist[0], 4), "max": round(dist[-1], 4)}
 
 
 def loop_area(face, n):
@@ -285,26 +377,41 @@ for name, body in bodies:
         skipped.append({"body": name, "why": why})
         continue
     cap, n, t_mm = found
-    ents, model_len = entities_of(cap, n)
-    x0, y0, x1, y1 = bounds(ents)
-    ents = moved(ents, -x0, -y0)
-    path = os.path.join(folder, safe_name("%s %.2fmm" % (name, t_mm)) + ".dxf")
-    write_dxf(path, ents)
-    dxf_len = sum(length_of(e) for e in ents)
+    nominal, model_len = entities_of(cap, n)                   # the model's outline: what gets checked
+    dxf_len = sum(length_of(e) for e in nominal)
+    nx0, ny0, nx1, ny1 = bounds(nominal)
+    cut, kcheck = kerf_entities(cap, n, kerf) if kerf > 0 else (nominal, None)
+    x0, y0, x1, y1 = bounds(cut)
+    cut = moved(cut, -x0, -y0)
+    path = os.path.join(folder, safe_name("%s %.2fmm%s" % (name, t_mm, tag)) + ".dxf")
+    write_dxf(path, cut)
     area_model, area_dxf = cap.area * 100.0, loop_area(cap, n)
     vol_check = try_value(lambda: body.volume * 1000.0 / (cap.area * 100.0 * t_mm))
     sheet_t = next((v for k, v in sheet_mm.items() if k in name.lower()), round(t_mm, 3))
-    parts.append({"body": name, "file": os.path.basename(path), "thickness_mm": round(t_mm, 3),
-                  "sheet_mm": sheet_t,
-                  "size_mm": [round(x1 - x0, 2), round(y1 - y0, 2)], "holes": cap.loops.count - 1,
-                  "entities": read_back(path),
-                  "cut_length_mm": round(dxf_len, 2),
-                  "cut_length_error_pct": round(100 * abs(dxf_len - model_len) / model_len, 4),
-                  "area_mm2": round(area_model, 2),
-                  "area_error_pct": round(100 * abs(area_dxf - area_model) / area_model, 4),
-                  "volume_over_area_x_t": round(vol_check, 5) if vol_check else None,
-                  "_ents": ents, "_w": x1 - x0, "_h": y1 - y0})
+    part = {"body": name, "file": os.path.basename(path), "thickness_mm": round(t_mm, 3),
+            "sheet_mm": sheet_t,
+            "size_mm": [round(nx1 - nx0, 2), round(ny1 - ny0, 2)], "holes": cap.loops.count - 1,
+            "entities": read_back(path),
+            "cut_length_mm": round(dxf_len, 2),
+            "cut_length_error_pct": round(100 * abs(dxf_len - model_len) / model_len, 4),
+            "area_mm2": round(area_model, 2),
+            "area_error_pct": round(100 * abs(area_dxf - area_model) / area_model, 4),
+            "volume_over_area_x_t": round(vol_check, 5) if vol_check else None,
+            "_ents": cut, "_w": x1 - x0, "_h": y1 - y0}
+    if kerf > 0:
+        part.update({"kerf_mm": kerf, "drawn_size_mm": [round(x1 - x0, 3), round(y1 - y0, 3)],
+                     "kerf_offset_check_mm": dict(kcheck, target=round(kerf / 2, 4))})
+    parts.append(part)
     flush()
+
+if kerf > 0:                                                  # cut this first, then measure it
+    side = 20.0 + kerf
+    square = [("LINE", (0, 0), (side, 0)), ("LINE", (side, 0), (side, side)),
+              ("LINE", (side, side), (0, side)), ("LINE", (0, side), (0, 0))]
+    coupon = os.path.join(folder, "00 kerf coupon 20mm%s.dxf" % tag)
+    write_dxf(coupon, square)
+    out["coupon"] = {"file": os.path.basename(coupon), "drawn_mm": round(side, 3),
+                     "how": "cut it first and measure it: real kerf = %.2f - your reading (mm)" % side}
 
 # Sheets: one set per thickness, parts in rows, turned 90 degrees when that is what fits.
 sheets = []
@@ -335,7 +442,7 @@ for t in sorted({p["sheet_mm"] for p in parts}):          # the sheet it is cut 
                 bx0, by0, _, _ = bounds(e)
                 e = moved(e, -bx0, -by0)
             ents += moved(e, px, py)
-        path = os.path.join(folder, "sheet %.2fmm %d of %d.dxf" % (t, i + 1, len([q for q in pages if q])))
+        path = os.path.join(folder, "sheet %.2fmm %d of %d%s.dxf" % (t, i + 1, len([q for q in pages if q]), tag))
         write_dxf(path, ents)
         used = max(bounds(ents)[2], 1), max(bounds(ents)[3], 1)
         sheets.append({"file": os.path.basename(path), "thickness_mm": t, "parts": len(page),
@@ -348,6 +455,10 @@ for p in parts:
 too_big = [p["body"] for p in parts if p.get("fits_bed") is False]
 worst = max([p["cut_length_error_pct"] for p in parts] + [p["area_error_pct"] for p in parts] or [0])
 print("%d parts, %d skipped, %d sheets in %s" % (len(parts), len(skipped), len(sheets), folder))
+if kerf > 0:
+    worst_k = max([abs(p["kerf_offset_check_mm"]["median"] - kerf / 2) for p in parts] or [0])
+    print("kerf %.2f mm baked in: set the laser's own offset to 0. Moved loops sit %.4f mm from their "
+          "target half-kerf at worst (median per part). Cut the coupon first." % (kerf, worst_k))
 print("largest disagreement with the model: %.4f %%" % worst)
 if too_big:
     print("bigger than the %.0f x %.0f bed: %s" % (bed_w, bed_h, ", ".join(too_big)))
