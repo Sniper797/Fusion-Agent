@@ -276,3 +276,12 @@ Re-measure on your machine: `python tools/bench_mcp.py`. It finds the MCP port b
 ## With Claude Code
 
 Open Claude Code in this folder and ask for what you want in plain words, such as "check the open design for interference" or "export an STL of every body". `CLAUDE.md` explains the method and the rules to it.
+
+## License
+
+Copyright (c) 2026 Mohammad Ghassan. Released under the [PolyForm Strict License 1.0.0](LICENSE.md):
+
+- **Allowed:** downloading and using it for learning, experiments and personal projects, and at universities and non-profit organizations.
+- **Not allowed without written permission:** changing it, building other work on it, redistributing or passing it on, or commercial use. Anyone who wants it should download it from here.
+
+For permission or collaboration, reach out on [GitHub](https://github.com/Sniper797).
