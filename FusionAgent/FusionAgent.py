@@ -42,7 +42,7 @@ import threading
 import time
 import traceback
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 EVENT_ID = "FusionAgentJobEvent"
 POLL_SEC = 0.05         # how often the watcher looks for a job: a stat call, nothing more
 BEAT_SEC = 1.0          # how often it rewrites alive.json
@@ -272,10 +272,403 @@ def save_viewport(path, width=1600, height=1000, fit=False):
     return bool(ok) and os.path.isfile(path)
 
 
+# ------------------------------------------- giving Fusion's main thread back
+# A job runs inside a custom-event handler, so while it runs Fusion's own idle queue does not: the
+# upload after a save, drawings that update "asynchronously". let_fusion_work() lets that queue run.
+# Measured 11 Nov 2026 (Fusion 2706.1.17): a saveAs left the file at "v0" with a local path for id
+# until the job ended; save_document() had version 2 in the cloud 12 s later, inside the job.
+# Fusion's drawing PDF export is worse: called straight from a job it never finishes and gives up
+# after exactly 600 s with "3 : export timed out" (ARIES three times; a one-sheet box drawing too,
+# even after 10 s of let_fusion_work). The same call inside a command's execute event took 0.19 s.
+# run_in_command() starts such a command from the job and waits for it.
+
+_job_cancel_file = None     # set while a job runs, so the helpers below can stop at a cancel
+_job_flush = None
+
+
+def _check_job_cancel():
+    if _job_cancel_file and os.path.exists(_job_cancel_file):
+        raise JobCancelled("cancelled while waiting for Fusion; the result so far is kept")
+
+
+def idle_tasks():
+    """The tasks waiting in Fusion's idle queue, by name (text command Application.ListIdleTasks):
+    {"queue": [...], "incomplete": [...]}. Some re-queue themselves forever (cursor, keys), so an
+    empty list is not to be expected; look for the ones that matter, or wait for a condition."""
+    text = try_value(lambda: _app.executeTextCommand("Application.ListIdleTasks"), "") or ""
+    out_, part = {"queue": [], "incomplete": []}, None
+    for line in text.splitlines():
+        s = line.strip()
+        if s.lower().startswith("*incomplete"):
+            part = "incomplete"
+        elif s.lower().startswith("*queue"):
+            part = "queue"
+        elif s and part and not s.lower().startswith("size:"):
+            out_[part].append(s)
+    return out_
+
+
+def let_fusion_work(seconds=5.0, until=None, check_every=0.25):
+    """Hand the main thread back to Fusion for up to `seconds` inside a job: process its window
+    messages (adsk.doEvents) and run its idle tasks (Application.ExeIdleTasks), again and again.
+    With `until` (a function), stop as soon as it returns True; it is checked every `check_every`
+    seconds. Returns {"seconds", "rounds", "met"}; "met" is None without `until`.
+    Fusion's window answers clicks meanwhile. A cancel (run_job.py cancel) stops it here."""
+    t0 = last_check = last_flush = time.time()
+    rounds = 0
+    while True:
+        adsk.doEvents()
+        try:
+            _app.executeTextCommand("Application.ExeIdleTasks")
+        except Exception:
+            pass
+        rounds += 1
+        _check_job_cancel()
+        now = time.time()
+        if until is not None and (now - last_check >= check_every or rounds == 1):
+            last_check = now
+            if try_value(until, False):
+                return {"seconds": round(now - t0, 2), "rounds": rounds, "met": True}
+        if now - t0 >= seconds:
+            return {"seconds": round(now - t0, 2), "rounds": rounds, "met": False if until is not None else None}
+        if _job_flush is not None and now - last_flush >= 5:
+            last_flush = now
+            _job_flush()                 # the client sees progress; a cancel stops here too
+        time.sleep(0.02)
+
+
+def _job_document(document):
+    d = document or _target or _app.activeDocument
+    if d is None:
+        raise RuntimeError("No document: open one in Fusion, or pass document=...")
+    return d
+
+
+def _in_cloud(d):
+    """The document's file has its cloud id: right after a first save it is a local path ("v0")."""
+    return str(try_value(lambda: d.dataFile.id, "") or "").startswith("urn:")
+
+
+def save_document(description, document=None, timeout=900, settle=2.0, wait_upload=True, name=None, folder=None):
+    """Save a new version of a document from a job, as Ctrl+S does, and wait until Fusion has
+    finished: its documentSaved event, then (wait_upload) the new version in the cloud, which a
+    drawing needs before it can update to it. Nothing else touches the document meanwhile.
+    A document never saved needs `folder` (a DataFolder) and `name`: that is the first save, saveAs.
+
+    Refuses when a command is running in Fusion (the API cannot save inside a command's
+    transaction). Returns {"ok", "skipped", "name", "version_before", "version", "id", "seconds",
+    "saved_event", ...}."""
+    d = _job_document(document)
+    first = not d.isSaved
+    if first and (folder is None or not name):
+        raise RuntimeError("%r was never saved; pass name=... and folder=<DataFolder> for its first save (saveAs)."
+                           % d.name)
+    cmd = try_value(lambda: _ui.activeCommand)
+    if cmd and cmd != "SelectCommand":
+        raise RuntimeError("Fusion is in the %s command. Saving inside a command is not supported by the API; "
+                           "finish or cancel it in Fusion (Esc) and run the job again." % cmd)
+    before = None if first else try_value(lambda: d.dataFile.latestVersionNumber)
+    result = {"name_before": d.name, "version_before": before}
+    if not first and not d.isModified:
+        result.update(ok=True, skipped="not modified: nothing to save", name=d.name, version=before,
+                      id=try_value(lambda: d.dataFile.id))
+        return result
+    result["settle"] = let_fusion_work(settle)           # finish what Fusion had queued before saving
+    events = []
+
+    class _Saved(adsk.core.DocumentEventHandler):
+        def __init__(self):
+            super(_Saved, self).__init__()
+
+        def notify(self, eventArgs):
+            events.append(try_value(lambda: eventArgs.document.name, "?"))
+
+    handler = _Saved()
+    _app.documentSaved.add(handler)
+    t0 = time.time()
+    uploaded = lambda: _in_cloud(d) and (d.dataFile.latestVersionNumber or 0) > (before or 0)
+    try:
+        ok = d.saveAs(name, folder, description, "") if first else d.save(description)
+        result["ok"] = bool(ok)
+        if ok:
+            result["wait_saved"] = let_fusion_work(timeout, until=lambda: bool(events) or not d.isModified)
+            if wait_upload:
+                left = max(1.0, timeout - (time.time() - t0))
+                result["wait_upload"] = let_fusion_work(left, until=uploaded, check_every=1.0)
+    finally:
+        try_value(lambda: _app.documentSaved.remove(handler))
+    result.update(seconds=round(time.time() - t0, 2), saved_event=events, name=d.name,
+                  isModified=try_value(lambda: d.isModified),
+                  version=try_value(lambda: d.dataFile.latestVersionNumber), id=try_value(lambda: d.dataFile.id))
+    if result["ok"] and wait_upload and not try_value(uploaded, False):
+        result["warning"] = "saved, but the new version had not reached the cloud after %s s" % timeout
+    return result
+
+
+def _drawing_document(document):
+    import adsk.drawing
+    d = _job_document(document)
+    dd = adsk.drawing.DrawingDocument.cast(d)
+    if dd is None:
+        raise RuntimeError("%r is not a drawing." % try_value(lambda: d.name))
+    return dd
+
+
+def _references(dd):
+    refs = []
+    for r in try_value(lambda: list(dd.documentReferences), []) or []:
+        refs.append({"file": try_value(lambda: r.dataFile.name), "version": try_value(lambda: r.version),
+                     "latest": try_value(lambda: r.dataFile.latestVersionNumber),
+                     "isOutOfDate": try_value(lambda: r.isOutOfDate)})
+    return refs
+
+
+def _behind(dd):
+    """True when a design the drawing shows has a newer version. Read from the references:
+    DrawingDocument.isUpToDate said True while its one reference was v2 of 3 (11 Nov 2026)."""
+    return any(r.get("isOutOfDate") or (r.get("version") and r.get("latest") and r["version"] < r["latest"])
+               for r in _references(dd)) or try_value(lambda: dd.isUpToDate) is False
+
+
+def _refresh_other_sheets(dd, settle):
+    """Make the sheets that are not active redraw their views. After updateAllReferences only the
+    active sheet showed the new version (box: sheet 2 said 70, sheet 1 still 60, also 20 s later);
+    turning each base view's thread-edge display off and back on made sheet 1 say 70. Projected
+    views follow their base view and have no such flag. Returns how many views were turned."""
+    drawing = dd.drawing
+    active = try_value(lambda: drawing.activeSheet.name)
+    flipped = []
+    for i in range(drawing.sheets.count):
+        sheet = drawing.sheets.item(i)
+        if sheet.name == active:
+            continue
+        for j in range(try_value(lambda: sheet.views.count, 0)):
+            v = sheet.views.item(j)
+            x = try_value(lambda: v.isShowThreadEdges)
+            if x is None:
+                continue
+            try:
+                v.isShowThreadEdges = not x
+                flipped.append((v, x))
+            except Exception:
+                pass
+    try:
+        let_fusion_work(1)
+    finally:
+        for v, x in flipped:                     # always back as they were
+            try_value(lambda: setattr(v, "isShowThreadEdges", x))
+    let_fusion_work(settle)
+    return len(flipped)
+
+
+def update_drawing(document=None, timeout=600, settle=5.0, all_sheets=True):
+    """Bring a drawing up to the latest saved version of its design: what the drawing's
+    out-of-date "Update" does (DrawingDocument.updateAllReferences), then let Fusion
+    recompute the views; with all_sheets, also on the sheets that are not active, which
+    otherwise kept the old version. Save the design first (save_document waits for the upload).
+    Returns {"was_behind", "ok", "behind", "views_redrawn", "references_before", "references", ...}."""
+    dd = _drawing_document(document)
+    result = {"drawing": dd.name, "references_before": _references(dd), "was_behind": _behind(dd)}
+    if not result["was_behind"]:
+        result.update(ok=True, behind=False, skipped="already shows the latest versions")
+        return result
+    t0 = time.time()
+    result["ok"] = bool(dd.updateAllReferences())
+    result["wait"] = let_fusion_work(timeout, until=lambda: not _behind(dd), check_every=1.0)
+    result["settle"] = let_fusion_work(settle)
+    if all_sheets:
+        result["views_redrawn"] = _refresh_other_sheets(dd, settle)
+    result.update(seconds=round(time.time() - t0, 2), behind=_behind(dd), references=_references(dd))
+    return result
+
+
+def _sheet_range(sheets):
+    if isinstance(sheets, (int, str)):
+        return str(sheets)
+    return ",".join(str(s) for s in sheets)
+
+
+_command_def = None          # one button definition per add-in session, reused by run_in_command
+_command_step = None         # what the next run of that command does: {"fn", "done", "value"|"error"}
+_command_handlers = []
+COMMAND_ID = "FusionAgentRunInCommand"
+
+
+def _command_definition():
+    """The add-in's own command, made on first use and deleted in stop()."""
+    global _command_def
+
+    class _Execute(adsk.core.CommandEventHandler):
+        def __init__(self):
+            super(_Execute, self).__init__()
+
+        def notify(self, eventArgs):
+            step = _command_step
+            if step is None:
+                return
+            step["started"] = time.time()
+            try:
+                step["value"] = step["fn"]()
+            except BaseException as e:           # Fusion would swallow it; the job re-raises it
+                step["error"] = e
+            finally:
+                step["done"] = True
+
+    class _Created(adsk.core.CommandCreatedEventHandler):
+        def __init__(self):
+            super(_Created, self).__init__()
+
+        def notify(self, eventArgs):
+            h = _Execute()
+            eventArgs.command.execute.add(h)
+            _command_handlers.append(h)
+            del _command_handlers[:-20]          # keep the latest ones alive, not every one ever made
+
+    if _command_def is None or not try_value(lambda: _command_def.isValid, False):
+        old = _ui.commandDefinitions.itemById(COMMAND_ID)
+        if old:
+            old.deleteMe()
+        _command_def = _ui.commandDefinitions.addButtonDefinition(COMMAND_ID, "FusionAgent step", "")
+        created = _Created()
+        _command_def.commandCreated.add(created)
+        _command_handlers.append(created)
+    return _command_def
+
+
+def run_in_command(fn, timeout=600):
+    """Run fn() inside a Fusion command's execute event, from a job, and return its value (or raise
+    its exception). Some API calls only finish there: DrawingExportManager.execute never returns
+    inside a job (600 s, then "export timed out") and took 0.19 s this way. The job starts the
+    command and keeps Fusion working until it is done (let_fusion_work), so the job still ends with
+    the whole result. Starting a command would end the one open in Fusion, so this refuses then.
+    Never save inside fn: the API does not allow saving within a command."""
+    global _command_step
+    cmd = try_value(lambda: _ui.activeCommand)
+    if cmd and cmd != "SelectCommand":
+        raise RuntimeError("Fusion is in the %s command; starting another would end it. Finish or cancel it "
+                           "in Fusion (Esc) and run the job again." % cmd)
+    step = {"fn": fn, "done": False}
+    _command_step = step
+    try:
+        if not _command_definition().execute():
+            raise RuntimeError("Fusion refused to start the FusionAgent step command.")
+        wait = let_fusion_work(timeout, until=lambda: step["done"], check_every=0.05)
+        if not step["done"]:
+            raise RuntimeError("the command step %s within %s s" % (
+                "did not finish" if step.get("started") else "never started", timeout))
+        let_fusion_work(0.2)                     # let Fusion close the command before anything else
+    finally:
+        _command_step = None
+    if "error" in step:
+        raise step["error"]
+    return step.get("value")
+
+
+def export_drawing_pdf(path, document=None, sheets=None, line_weights=True, settle=2.0, open_pdf=False,
+                       timeout=1200):
+    """Export a drawing to PDF from a job: what File > Export PDF does. sheets: None for all, 3,
+    "1-4" or [1, 3, 5] (1-based). The export runs in run_in_command(): straight from a job it
+    never finishes. `settle` seconds of let_fusion_work first let the drawing finish what it had
+    queued. The drawing need not be the active document.
+    Returns {"ok", "file", "bytes", "export_seconds", ...}; ok only when a new, non-empty file exists."""
+    import adsk.drawing
+    dd = _drawing_document(document)
+    drawing = dd.drawing
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    old = try_value(lambda: os.path.getmtime(path))
+    result = {"drawing": dd.name, "sheets": drawing.sheets.count, "settle": let_fusion_work(settle)}
+    opt = drawing.exportManager.createPDFExportOptions(path)
+    opt.openPDF = bool(open_pdf)
+    opt.useLineWeights = bool(line_weights)
+    if sheets is not None:
+        opt.sheetsToExport = adsk.drawing.PDFSheetsExport.RangePDFSheetsExport
+        opt.sheetRange = _sheet_range(sheets)
+        result["range"] = opt.sheetRange
+    t0 = time.time()
+    ok = run_in_command(lambda: drawing.exportManager.execute(opt), timeout=timeout)
+    result["export_seconds"] = round(time.time() - t0, 2)
+    new = try_value(lambda: os.path.getmtime(path))
+    size = try_value(lambda: os.path.getsize(path), 0)
+    result.update(file=path, bytes=size, execute_returned=bool(ok),
+                  ok=bool(ok) and new is not None and new != old and size > 0)
+    return result
+
+
+TITLE_BLOCK_COMMAND = "FusionDrawingTitleBlockEditCommand"
+TITLE_BLOCK_FIELDS = ("department", "technicalRef", "createdBy", "createdDate", "approvedBy", "approvedDate",
+                      "documentType", "documentStatus", "title1", "title2", "title3", "dwgNo", "revision",
+                      "issueDate", "sheet")
+
+
+def _title_block_fields():
+    """The Edit Title Block dialog's fields as {id: value}, read with text commands: the inputs'
+    labels from UI.CurrentCommandInfo, the values from Toolkit.cmdDialog ("id, eDropDownEntry, label, value")."""
+    info = json.loads(_app.executeTextCommand("UI.CurrentCommandInfo"))
+    labels = {i.get("id"): i.get("name") or "" for i in info.get("inputs", [])}
+    fields = {}
+    for line in _app.executeTextCommand("Toolkit.cmdDialog /all /verbose").splitlines():
+        parts = [p.strip() for p in line.strip().split(", ")]
+        if len(parts) >= 2 and parts[0] in TITLE_BLOCK_FIELDS and parts[1] == "eDropDownEntry":
+            rest = parts[2:]
+            if rest and labels.get(parts[0]) and rest[0] == labels[parts[0]]:
+                rest = rest[1:]
+            fields[parts[0]] = ", ".join(rest)
+    return fields
+
+
+def set_title_block(values, document=None, timeout=30):
+    """Fill title-block fields of the drawing's ACTIVE sheet through Fusion's own Edit Title Block
+    command, driven by text commands (Commands.SetString, NuCommands.CommitCmd); the API has no
+    setter for these values. values: {"createdBy": "Mohammad Ghassan", ...}, keys from
+    TITLE_BLOCK_FIELDS. Each sheet keeps its own values, and the API cannot make another sheet
+    active (no Sheet.activate, activeSheet is read-only, nothing in a drawing can be selected), so
+    the user clicks each sheet's tab between calls. Sheets.applyTitleBlockToAllSheets() puts the
+    defaults back (measured). Returns {"sheet", "before", "after"}; nothing is committed unless
+    every field reads back as asked."""
+    import adsk.drawing
+    bad = [k for k in values if k not in TITLE_BLOCK_FIELDS]
+    if bad:
+        raise ValueError("unknown title-block fields %s; known: %s" % (bad, ", ".join(TITLE_BLOCK_FIELDS)))
+    if any('"' in str(v) for v in values.values()):
+        raise ValueError('a title-block value cannot contain a double quote (")')
+    dd = _drawing_document(document)
+    if not dd.isActive:
+        dd.activate()
+        let_fusion_work(1)
+    cmd = try_value(lambda: _ui.activeCommand)
+    if cmd and cmd != "SelectCommand":
+        raise RuntimeError("Fusion is in the %s command; finish or cancel it (Esc) first." % cmd)
+    sheet = try_value(lambda: dd.drawing.activeSheet.name)
+    _ui.commandDefinitions.itemById(TITLE_BLOCK_COMMAND).execute()
+    if not let_fusion_work(timeout, until=lambda: _ui.activeCommand == TITLE_BLOCK_COMMAND, check_every=0.1)["met"]:
+        raise RuntimeError("Fusion did not open Edit Title Block within %s s" % timeout)
+    committed = False
+    try:
+        before = _title_block_fields()
+        for key, value in values.items():
+            _app.executeTextCommand('Commands.SetString %s "%s"' % (key, value))
+        let_fusion_work(0.3)
+        after = _title_block_fields()
+        wrong = {k: after.get(k) for k, v in values.items() if after.get(k) != str(v)}
+        if wrong:
+            raise RuntimeError("these fields did not take the new value, so nothing was committed: %s" % wrong)
+        _app.executeTextCommand("NuCommands.CommitCmd")
+        committed = let_fusion_work(timeout, until=lambda: _ui.activeCommand == "SelectCommand",
+                                    check_every=0.1)["met"]
+    finally:
+        if not committed and _ui.activeCommand == TITLE_BLOCK_COMMAND:
+            _ui.terminateActiveCommand()          # cancel: the sheet keeps its old values
+            let_fusion_work(0.5)
+    return {"sheet": sheet, "before": {k: before.get(k) for k in values}, "after": {k: after.get(k) for k in values},
+            "committed": committed}
+
+
 HELPERS = {f.__name__: f for f in (
     design, mm, cm, point_mm, find_occurrence, bbox_mm, safe_name, try_value,
     to_component_space, add_tool_and_combine, require_timeline_at_end,
-    group_timeline, save_viewport)}
+    group_timeline, save_viewport, idle_tasks, let_fusion_work, save_document,
+    update_drawing, export_drawing_pdf, run_in_command, set_title_block)}
 
 
 # ------------------------------------------------------------------------ jobs
@@ -532,7 +925,7 @@ def _geometry_summary(before, after, notes):
 
 
 def _run_job(job, result):
-    global _target
+    global _target, _job_cancel_file, _job_flush
     action = job.get("action", "exec_file")
     if action == "ping":
         result["out"] = _ping()
@@ -570,6 +963,7 @@ def _run_job(job, result):
         _write_json(RESULT, result)
         check_cancel()
 
+    _job_cancel_file, _job_flush = cancel_file, flush     # for let_fusion_work() and the helpers on it
     scope = dict(HELPERS)
     scope.update({"__name__": "__fusion_agent_job__", "__file__": path,
                   "adsk": adsk, "app": _app, "ui": _ui,
@@ -684,7 +1078,7 @@ def _journal(job, result, started):
 
 
 def _execute():
-    global _target
+    global _target, _job_cancel_file, _job_flush
     result = {"id": None, "status": "running", "agent": VERSION}
     job = {}
     t0 = time.time()
@@ -705,6 +1099,7 @@ def _execute():
         _record_error(result, e)
     finally:
         _target = None                       # a pin never leaks into the next job
+        _job_cancel_file = _job_flush = None
         result["active_after"] = try_value(lambda: _app.activeDocument.name)
         result["seconds"] = round(time.time() - t0, 2)
         try:
@@ -762,7 +1157,8 @@ class _Watcher(threading.Thread):
                     os.makedirs(AGENT_DIR, exist_ok=True)     # survives the folder being deleted
                     _write_json(BEAT, {"t": now, "pid": os.getpid(), "agent": VERSION,
                                        "sha": SELF_SHA, "file": __file__,
-                                       "features": ["doc", "queue", "receipt", "cancel", "full-receipt", "receipt-limit"]})
+                                       "features": ["doc", "queue", "receipt", "cancel", "full-receipt", "receipt-limit",
+                                                    "fusion-work"]})
                     last_beat = now
                 if os.path.isfile(RUNNING):
                     continue
@@ -833,7 +1229,13 @@ def run(context):
 
 
 def stop(context):
-    global _event, _handler, _stop, _thread
+    global _event, _handler, _stop, _thread, _command_def
+    try:
+        if _command_def is not None and _command_def.isValid:
+            _command_def.deleteMe()
+    except Exception:
+        pass
+    _command_def = None
     try:
         if _stop:
             _stop.set()

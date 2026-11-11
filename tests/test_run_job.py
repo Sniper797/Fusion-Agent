@@ -100,6 +100,22 @@ class Warnings(unittest.TestCase):
     def test_save(self):
         self.assertEqual(rules("app.activeDocument.save('x')\n")[1], ["save"])
 
+    def test_bare_pdf_export_warns(self):
+        code = "opt = drawing.exportManager.createPDFExportOptions(p)\ndrawing.exportManager.execute(opt)\n"
+        self.assertEqual(rules(code)[1], ["pdf-export"])
+        self.assertEqual(rules("export_drawing_pdf('a.pdf')\n")[1], [])
+
+    def test_version_gate_sees_bare_helper_calls_only(self):
+        self.assertEqual(run_job.helpers_needing_1_6("r = save_document('x')\nexport_drawing_pdf(p)\n"),
+                         ["export_drawing_pdf", "save_document"])
+        # a method of another object, or the script's own function of that name, needs nothing
+        self.assertEqual(run_job.helpers_needing_1_6("fa.let_fusion_work(5)\ndef idle_tasks():\n    pass\n"), [])
+        self.assertEqual(run_job.helpers_needing_1_6("# then save_document()\ns = 'export_drawing_pdf(p)'\n"), [])
+
+    def test_export_timeout_has_a_hint(self):
+        self.assertTrue(any("export_drawing_pdf" in h for h in run_job.hints_for("RuntimeError: 3 : export timed out")))
+        self.assertTrue(any("1.6.0" in h for h in run_job.hints_for("NameError: name 'save_document' is not defined")))
+
     def test_active_names_warn_only_when_pinned(self):
         code = "p = app.activeProduct\n"
         self.assertEqual(rules(code, pinned=True)[1], ["active-with-doc"])

@@ -44,12 +44,15 @@ import sys
 import time
 import uuid
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 NEEDS_FOR_DOC = (1, 1, 0)
 NEEDS_FOR_QUEUE = (1, 2, 0)
 NEEDS_FOR_CANCEL = (1, 3, 0)
 NEEDS_FOR_FULL_RECEIPT = (1, 4, 0)
 NEEDS_FOR_RECEIPT_LIMIT = (1, 5, 0)    # full receipt by default, with a body limit the add-in honours
+NEEDS_FOR_FUSION_WORK = (1, 6, 0)      # let_fusion_work, save_document, run_in_command, drawings
+FUSION_WORK_HELPERS = ("let_fusion_work", "idle_tasks", "save_document", "update_drawing", "export_drawing_pdf",
+                       "run_in_command", "set_title_block")
 FULL_RECEIPT_MAX_BODIES = 2000         # measured: 0.4 s per job at 633 bodies; more is counted, not measured
 KEEP_SECONDS = 2 * 24 * 3600        # inline scripts and saved results older than this are swept
 
@@ -71,6 +74,18 @@ REFUSE = {
     "modal-ui": "calls {attr}(). It waits for a click or a pick in Fusion and holds every job behind it; "
                 "return results in `out` instead.",
 }
+
+
+def helpers_needing_1_6(code):
+    """The 1.6.0 helpers a script calls by their bare name: save_document(...), not fa.save_document(...),
+    a comment or a string. Read from the syntax tree; a script that does not parse needs nothing here."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    own = {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    return sorted({n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                   and n.func.id in FUSION_WORK_HELPERS and n.func.id not in own})
 
 
 def preflight(code, filename="<code>", pinned=False):
@@ -196,7 +211,13 @@ def preflight(code, filename="<code>", pinned=False):
                                      "to read it hidden, then close(False)."))
             elif attr in ("save", "saveAs"):
                 warnings.append(("save", line, "%s(): saving the user's document is their call; "
-                                 "the add-in never saves on its own." % attr))
+                                 "the add-in never saves on its own.%s" % (attr, " To save from a job, use "
+                                 "save_document(description), which waits until Fusion has finished." if attr == "save"
+                                 else "")))
+            elif attr == "createPDFExportOptions":
+                warnings.append(("pdf-export", line, "a bare exportManager.execute() of a drawing inside a job "
+                                 "never finishes: 'export timed out' after 600 s (11 Nov 2026). Use "
+                                 "export_drawing_pdf(path), which runs it inside a Fusion command (0.19 s)."))
             elif attr == "close" and args and isinstance(args[0], ast.Constant) and isinstance(args[0].value, bool):
                 if args[0].value:
                     warnings.append(("close", line, "close(True) saves the document before closing it."))
@@ -313,6 +334,10 @@ HINTS = [
     (r"No open document named|open documents match", "see the open documents with: python run_job.py ping"),
     (r"name 'doc' is not defined", "the installed add-in is older than 1.1.0: run install-windows.bat, then "
                                    "stop and run FusionAgent in Fusion (Shift+S)."),
+    (r"export timed out", "Fusion's drawing export never finishes inside a job. Use export_drawing_pdf(path) "
+                          "(add-in 1.6.0), which runs it inside a Fusion command: 0.19 s instead of 600."),
+    (r"name '(let_fusion_work|idle_tasks|save_document|update_drawing|export_drawing_pdf|run_in_command|set_title_block)' is not defined",
+     "that helper needs add-in 1.6.0: run python install.py, then stop and run FusionAgent in Fusion (Shift+S)."),
 ]
 
 
@@ -911,6 +936,12 @@ def main():
                     print("refused [%s] line %s: %s" % (rule, line, msg))
                 print("Not sent. If you are sure, add --allow %s" % ",".join(sorted({f[0] for f in refusals})))
                 return 5
+
+        used = helpers_needing_1_6(code)
+        if used and version_tuple(installed) < NEEDS_FOR_FUSION_WORK:
+            print("%s needs FusionAgent 1.6.0 or newer, and the installed add-in is %s." % (", ".join(used), installed))
+            print("Run python install.py, then in Fusion (Shift+S) stop FusionAgent and run it again.")
+            return 2
 
         args = {}
         try:

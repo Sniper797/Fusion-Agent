@@ -277,6 +277,125 @@ class ReceiptLimit(unittest.TestCase):
         self.fa._target = None
 
 
+class FusionWork(unittest.TestCase):
+    """let_fusion_work() and the helpers on it, against a stub Fusion (1.6.0)."""
+
+    LIST = ("Size: 3\n*Queue:\n  Ns::LambdaTask\n  QTCursorMonitor\n*Incomplete queue:\n  DocumentFullyOpenedTask\n")
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="fa_test_")
+        self.fa = load_addin(self.dir)
+        self.pumped = []
+        sys.modules["adsk"].doEvents = lambda: self.pumped.append(1)
+        self.commands = []
+
+        def text(cmd):
+            self.commands.append(cmd)
+            return self.LIST if cmd == "Application.ListIdleTasks" else ""
+        self.fa._app = types.SimpleNamespace(executeTextCommand=text)
+
+    def tearDown(self):
+        self.fa._job_cancel_file = self.fa._job_flush = None
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_idle_tasks_are_split_by_queue(self):
+        self.assertEqual(self.fa.idle_tasks(), {"queue": ["Ns::LambdaTask", "QTCursorMonitor"],
+                                                "incomplete": ["DocumentFullyOpenedTask"]})
+
+    def test_stops_as_soon_as_the_condition_holds(self):
+        calls = []
+        got = self.fa.let_fusion_work(30, until=lambda: calls.append(1) or len(calls) >= 3, check_every=0)
+        self.assertTrue(got["met"])
+        self.assertLess(got["seconds"], 5)
+        self.assertEqual(len(calls), 3)
+        self.assertIn("Application.ExeIdleTasks", self.commands)     # the idle queue ran, not only messages
+        self.assertGreaterEqual(len(self.pumped), 3)
+
+    def test_gives_up_after_the_time(self):
+        got = self.fa.let_fusion_work(0.1, until=lambda: False)
+        self.assertIs(got["met"], False)
+        self.assertIsNone(self.fa.let_fusion_work(0.05)["met"])        # no condition: neither met nor missed
+
+    def test_a_condition_that_raises_counts_as_not_yet(self):
+        self.assertIs(self.fa.let_fusion_work(0.1, until=lambda: 1 / 0)["met"], False)
+
+    def test_a_cancel_stops_the_wait(self):
+        cancel = os.path.join(self.dir, "cancel-me")
+        open(cancel, "w").close()
+        self.fa._job_cancel_file = cancel
+        with self.assertRaises(self.fa.JobCancelled):
+            self.fa.let_fusion_work(30)
+
+    def test_sheet_ranges(self):
+        self.assertEqual(self.fa._sheet_range(3), "3")
+        self.assertEqual(self.fa._sheet_range("1-4"), "1-4")
+        self.assertEqual(self.fa._sheet_range([1, 3, 5]), "1,3,5")
+
+    def doc(self, **kw):
+        d = dict(name="Box v1", isSaved=True, isModified=True, dataFile=types.SimpleNamespace(latestVersionNumber=1))
+        d.update(kw)
+        return types.SimpleNamespace(**d)
+
+    def test_save_refuses_inside_a_command(self):
+        self.fa._ui = types.SimpleNamespace(activeCommand="ExtrudeCommand")
+        with self.assertRaisesRegex(RuntimeError, "ExtrudeCommand"):
+            self.fa.save_document("x", document=self.doc())
+
+    def test_save_refuses_a_never_saved_document_without_a_folder(self):
+        self.fa._ui = types.SimpleNamespace(activeCommand="SelectCommand")
+        with self.assertRaisesRegex(RuntimeError, "saveAs"):
+            self.fa.save_document("x", document=self.doc(isSaved=False))
+
+    def test_a_local_path_is_not_in_the_cloud_yet(self):
+        # right after a first save the file id is a local path, and the name ends in v0 (measured)
+        local = self.doc(dataFile=types.SimpleNamespace(id="C:/Users/x/_FA test box.bd60.f3d"))
+        self.assertFalse(self.fa._in_cloud(local))
+        self.assertTrue(self.fa._in_cloud(self.doc(dataFile=types.SimpleNamespace(id="urn:adsk.wipprod:dm.lineage:Q"))))
+
+    def test_other_sheets_are_redrawn_and_left_as_they_were(self):
+        seen = []
+
+        class View:
+            def __init__(self, flag):
+                self._flag = flag
+
+            @property
+            def isShowThreadEdges(self):
+                if self._flag is None:
+                    raise RuntimeError("projected views have no such flag")
+                return self._flag
+
+            @isShowThreadEdges.setter
+            def isShowThreadEdges(self, value):
+                seen.append(value)
+                self._flag = value
+
+        def sheet(name, *views):
+            vs = list(views)
+            return types.SimpleNamespace(name=name, views=types.SimpleNamespace(count=len(vs), item=vs.__getitem__))
+
+        base1, proj1, base2, active_view = View(True), View(None), View(False), View(True)
+        sheets = [sheet("one", base1, proj1), sheet("two", base2), sheet("active", active_view)]
+        drawing = types.SimpleNamespace(activeSheet=sheets[2], sheets=types.SimpleNamespace(
+            count=3, item=sheets.__getitem__))
+        n = self.fa._refresh_other_sheets(types.SimpleNamespace(drawing=drawing), settle=0)
+        self.assertEqual(n, 2)                                     # the two base views off the active sheet
+        self.assertEqual((base1._flag, base2._flag, active_view._flag), (True, False, True))
+        self.assertEqual(seen, [False, True, True, False])         # turned, then back
+
+    def test_run_in_command_will_not_end_the_users_command(self):
+        self.fa._ui = types.SimpleNamespace(activeCommand="SketchCreate")
+        with self.assertRaisesRegex(RuntimeError, "SketchCreate"):
+            self.fa.run_in_command(lambda: 1)
+
+    def test_save_of_an_unmodified_document_does_nothing(self):
+        self.fa._ui = types.SimpleNamespace(activeCommand="SelectCommand")
+        got = self.fa.save_document("x", document=self.doc(isModified=False))
+        self.assertTrue(got["ok"])
+        self.assertIn("not modified", got["skipped"])
+        self.assertEqual(self.pumped, [])                              # returned before waiting on anything
+
+
 class Json(unittest.TestCase):
     def test_tuple_keys_survive(self):
         fa = load_addin(tempfile.mkdtemp(prefix="fa_test_"))

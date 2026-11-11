@@ -20,7 +20,9 @@ The script runs on Fusion's main thread. Ready-made names: `app`, `ui`, `adsk`,
 `point_mm(x, y, z)`, `try_value(fn, default)`, `to_component_space(temp_body, occ)`,
 `add_tool_and_combine(comp, body, tool, "cut" | "join" | "intersect", name)`,
 `require_timeline_at_end()`, `group_timeline(start, name)`,
-`save_viewport(path, w, h, fit)`, `safe_name(text)`, `check_cancel()`. `print()` output comes back too.
+`save_viewport(path, w, h, fit)`, `safe_name(text)`, `check_cancel()`, and with add-in 1.6.0 `let_fusion_work()`,
+`save_document(description)`, `update_drawing()`, `export_drawing_pdf(path, sheets)`, `run_in_command(fn)`,
+`set_title_block(values)`, `idle_tasks()`. `print()` output comes back too.
 Import standard modules (`os`, `math`, ...) yourself. Working examples are in `examples/`.
 
 ## Rules
@@ -48,3 +50,14 @@ Import standard modules (`os`, `math`, ...) yourself. Working examples are in `e
 21. STL: `examples/export_stl.py` moves bodies that Fusion wrote in their component's coordinates into the assembly and reports `written_in` and `box_error_mm`; use `frame: component` only when asked.
 22. When the user says "this face" or "the selected part", run `examples/selection.py`, then resolve the tokens with `design().findEntityByToken(token)` in the editing job and stop unless it returns exactly one entity (none: deleted; two: split by a later feature). The selection is the active document's.
 23. Long jobs: call `flush()` after each step. It writes progress and is where a cancelled job stops (exit 7, partial `out` kept). In an edit, call `group_timeline` in a `finally:` (as `snap_fit.py` does), so an edit stopped halfway is still one group to delete. Never wrap the whole script in a bare `except:`, which would swallow the cancel. A timeout stops a running job only with `--cancel-on-timeout`; exit 4 means it may still be running.
+24. A job holds Fusion's idle queue while it runs (add-in 1.6.0 notes, measured 11 Nov 2026). Never call a drawing's
+    `exportManager.execute()` straight from a job: it never finishes and gives up after 600 s ("export timed out").
+    Use `export_drawing_pdf(path, sheets=...)`, which runs it inside a Fusion command (0.4 s), or `run_in_command(fn)`
+    for other calls that hang the same way. Save only when the user asked, with `save_document(description)`: it
+    refuses while a command is open and waits for the documentSaved event and the cloud version. Bring a drawing to
+    the newest design version with `update_drawing()` (`DrawingDocument.isUpToDate` said True on an outdated
+    drawing; and only the active sheet followed the update until update_drawing redrew the others by toggling each
+    base view's isShowThreadEdges and back). Title-block values: `set_title_block({"createdBy": ...})` sets the ACTIVE sheet only; a job cannot
+    make another sheet active, and `applyTitleBlockToAllSheets()` resets the values. A plain `doc.save()` crashed
+    Fusion on ARIES (18 Oct 2026); save_document saved a 1,700-item test design twice (5.6 s, 8.5 s) but has not
+    been tried on ARIES: ask Mohammad before the first time.

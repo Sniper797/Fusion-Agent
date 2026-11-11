@@ -139,7 +139,9 @@ With add-in 1.2.0 or newer:
 - `computeAll()`.
 - Anything that waits for a click in Fusion: `messageBox`, `inputBox`, the file pickers, and `selectEntity`.
 
-**It only warns** about `allJoints`, `documents.open` without `False`, `save` and `saveAs`, `close(True)` and `close(False)`, and active-document names when you use `--doc`.
+**It only warns** about `allJoints`, `documents.open` without `False`, `save` and `saveAs`, `close(True)` and `close(False)`, active-document names when you use `--doc`, and a bare drawing PDF export (`createPDFExportOptions`), which never finishes inside a job.
+
+**It stops a script that calls a 1.6.0 helper** (`save_document`, `export_drawing_pdf`...) when the installed add-in is older, and says how to update it (exit code 2).
 
 - **To override:** `--allow modal-ui` (or the rule's name), or `--no-preflight`.
 - **Git Bash paths** such as `/c/Users/...` in `args` are rewritten to `C:/Users/...`, and it says so.
@@ -194,6 +196,39 @@ python run_job.py examples/laser_dxf.py --args "{\"kerf_mm\": 0.1}"
 - **Layout on the sheet (`layout`):** `maxrects` by default: each part, biggest first, goes where it fills the free space most snugly, turned 90 degrees when that fits better. On 200 random sets it needed 29% fewer sheets than rows (317 against 445). `rows` gives the old rows back. Each sheet reports how much of it is material, from the parts' real area, not their rectangles (`material_of_bed_pct`, and `material_of_used_area_pct` for the part of the bed in use).
 - **Not done yet:** packing by the parts' true outlines. Parts are packed by their bounding rectangles, so an L-shaped part reserves its whole rectangle.
 
+## Save, update a drawing, export it to PDF, fill its title block (1.6.0)
+
+A job runs inside an event handler on Fusion's main thread, so while it runs Fusion's own queue of idle work stands still. Some calls wait on that queue:
+
+- **The upload after a save:** a first save left the file at "v0", with a local path for its id, until the job ended.
+- **Exporting a drawing to PDF:** `exportManager.execute()` called straight from a job never finished. Fusion gave up after exactly 600 s with `3 : export timed out`. That happened on ARIES (24 sheets) three times, and on a one-sheet box drawing too, even after 10 s of waiting first. The same call inside a Fusion command took 0.19 s.
+
+Add-in 1.6.0 adds helpers that give Fusion its turn:
+
+| Helper | What it does | Measured on a test box (11 Nov 2026) |
+|---|---|---|
+| `let_fusion_work(seconds, until=None)` | Lets Fusion process its messages and idle tasks inside the job, until `until()` is true or the time is up | |
+| `save_document(description, name=None, folder=None)` | Saves like Ctrl+S, then waits for Fusion's `documentSaved` event and for the new version in the cloud. With `name` and `folder` it does the first save (saveAs) | Version 2 in the cloud after 13.5 s, inside the job |
+| `update_drawing()` | What the drawing's out-of-date Update does (`updateAllReferences`), then waits for the views | v2 to v3 in 7.9 s; the PDF then showed 60 instead of 50 |
+| `export_drawing_pdf(path, sheets=None)` | Export PDF, run inside a Fusion command. `sheets`: `3`, `"1-4"` or `[1, 3]`; all when left out | 0.4 s for one sheet; a range gave exactly that page |
+| `run_in_command(fn)` | Runs any `fn()` inside a Fusion command and returns its value: for other calls that only finish there | |
+| `set_title_block({"createdBy": "..."})` | Fills title-block fields of the **active** sheet through Fusion's own Edit Title Block command | "Mohammad Ghassan" in the PDF |
+
+```
+python run_job.py examples/save_document.py --doc "Box" --args "{\"description\": \"w = 60 mm\"}"
+python run_job.py examples/drawing_pdf.py --doc "Box Drawing" --args "{\"pdf\": \"C:/out/box.pdf\"}"
+python run_job.py examples/drawing_pdf.py --doc "Box Drawing" --args "{\"pdf\": \"C:/out/box.pdf\", \"per_sheet\": true}"
+python run_job.py examples/title_block.py --doc "Box Drawing" --args "{\"createdBy\": \"Mohammad Ghassan\"}"
+```
+
+- **Saving is still the user's call.** Send a save only when they asked for it, with their description. `save_document` refuses while a command is open in Fusion, because the API cannot save inside one.
+- **The order for a fresh drawing:** save the design with `save_document`, then run `drawing_pdf.py`. It updates the drawing to that version first.
+- **`DrawingDocument.isUpToDate` is not reliable.** It said True while the drawing showed v2 of 3. `update_drawing` reads the references' own versions instead.
+- **Only the active sheet follows an update by itself.** After `updateAllReferences` the box drawing's active sheet said 70, and sheet 1 still said 60, also 20 s later. So `update_drawing` then turns each base view's thread-edge display off and back on, on every other sheet, which makes them redraw: sheet 1 then said 80 like the active one. Nothing is left changed. `all_sheets=False` skips this.
+- **Title-block values belong to each sheet,** and a job cannot make another sheet active. The API has no `Sheet.activate`, `activeSheet` is read-only, and nothing in a drawing can be selected. So click the next sheet's tab in Fusion, then run `title_block.py` again. For new drawings, a drawing template (`CreateDrawingInput.templateFile`) whose title block already says the right name avoids the clicks.
+- **`Sheets.applyTitleBlockToAllSheets()` puts the defaults back:** after it, the name typed in was gone from every sheet.
+- **A large design:** a plain `doc.save()` crashed Fusion on ARIES (about 1,720 timeline items) on 18 Oct 2026. `save_document` saved a test design of 1,700 timeline items and 850 bodies in 5.6 s, then again after one more feature in 8.5 s, both versions in the cloud, with no crash. It has not been tried on ARIES itself, whose external parts and joints a test design lacks.
+
 ## Write your own script
 
 A script is an ordinary Python file that runs inside Fusion, with these names ready:
@@ -213,6 +248,7 @@ A script is an ordinary Python file that runs inside Fusion, with these names re
 | `try_value(fn, default)` | The value, or the fallback when Fusion refuses to compute it |
 | `to_component_space`, `add_tool_and_combine`, `require_timeline_at_end`, `group_timeline` | Tools for editing safely; `snap_fit.py` shows how to use them |
 | `save_viewport(path, w, h, fit)`, `safe_name(text)` | A picture of the view, and a valid file name |
+| `let_fusion_work`, `save_document`, `update_drawing`, `export_drawing_pdf`, `run_in_command`, `set_title_block`, `idle_tasks` | Saving and drawings (1.6.0); see the section above |
 
 - Whatever you `print` comes back to you too.
 - Import standard modules such as `os` and `math` yourself.
@@ -234,7 +270,7 @@ Then: `python run_job.py hello.py`
 2. **Read before you edit.** Measure the dimensions from the file itself; don't rely on memory.
 3. **Add at the end of the timeline, and gather the additions in one group.** You can delete the group in one click if you don't like the result.
 4. **Prove the edit with numbers:** run `check_clearance.py` afterwards.
-5. **The add-in never saves your documents.** Saving is up to you.
+5. **The add-in never saves your documents on its own.** Saving is up to you; a job saves only when you ask, through `save_document`.
 
 ## Security: read this
 
@@ -250,6 +286,7 @@ The add-in runs **any** Python file a job points to, with your account's rights 
 - **"FusionAgent is not running":** Fusion is closed, or the add-in is stopped. Start it from Shift+S.
 - **"busy":** only with add-ins older than 1.2.0: another job is running right now, possibly from another session. With 1.2.0 the job waits its turn in the queue. If a window open in Fusion, such as Scripts and Add-Ins, is holding the jobs, `run_job.py` names it after three seconds, and the job starts by itself once you close it. If Fusion crashes during a job, the add-in cleans up after it the next time Fusion starts.
 - **Timed out:** usually a dialog open in Fusion is blocking it, so close it. For long jobs use `--timeout 600`.
+- **`3 : export timed out` after 600 s:** a drawing exported straight from a job. Use `export_drawing_pdf`.
 - **Paths inside `args`:** write them as `C:/...`. A Git Bash path such as `/c/Users/...` used to fail silently; `run_job.py` now rewrites it.
 - **Fusion's interface freezes:** the script runs on Fusion's main thread, so the interface stops until it finishes. Split long work into parts.
 - **Don't search cloud files inside a job.** A script that walked the `app.data` projects and folders froze Fusion ("Not Responding") twice, once for nine minutes and once for about forty, until it was restarted. The pre-flight check now refuses this. If you need a file that is not open, open it yourself in Fusion first. If you know its path, go straight to it by name with `dataFolders.itemByName`, one level at a time.
