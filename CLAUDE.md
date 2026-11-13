@@ -59,5 +59,5 @@ Import standard modules (`os`, `math`, ...) yourself. Working examples are in `e
     drawing; and only the active sheet followed the update until update_drawing redrew the others by toggling each
     base view's isShowThreadEdges and back). Title-block values: `set_title_block({"createdBy": ...})` sets the ACTIVE sheet only; a job cannot
     make another sheet active, and `applyTitleBlockToAllSheets()` resets the values. A plain `doc.save()` crashed
-    Fusion on ARIES (18 Oct 2026); save_document saved a 1,700-item test design twice (5.6 s, 8.5 s) but has not
-    been tried on ARIES: ask Mohammad before the first time.
+    Fusion on ARIES (18 Oct 2026); save_document saved a 1,700-item test design twice (5.6 s, 8.5 s) and ARIES itself
+    on 13 Nov 2026 (v61, 183 s, 165 of them the upload). Save only when asked, after an f3d backup.
